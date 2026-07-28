@@ -1,0 +1,23 @@
+# fly.toml - Fly.io configuration for Discord bot (worker)
+app = "discord-bot-kusdev00"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[processes]
+  app = "python main.py"
+
+[deploy]
+  strategy = "rolling"
+
+[experimental]
+  auto_rollback = true
+
+# Free tier: 256MB RAM, 1 shared CPU, no sleep
+# Secrets (set via CLI, NOT in this file):
+# fly secrets set DISCORD_TOKEN=***
+# fly secrets set WELCOME_TEST_CHANNEL_ID=1510712073196142702

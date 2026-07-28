@@ -1,0 +1,25 @@
+# koyeb.yaml - Koyeb deployment configuration
+# Deploy with: koyeb service create github/Kusdev00/discord-bot --name discord-bot --type worker --region fra
+
+service:
+  name: discord-bot
+  type: worker
+  regions:
+    - fra
+  git:
+    branch: main
+    repository: Kusdev00/discord-bot
+  build:
+    dockerfile: Dockerfile
+  env:
+    - name: DISCORD_TOKEN
+      value: "REPLACE_WITH_YOUR_TOKEN"
+    - name: WELCOME_TEST_CHANNEL_ID
+      value: "1510712073196142702"
+    - name: LOG_LEVEL
+      value: "INFO"
+    - name: DEBUG
+      value: "false"
+  scaling:
+    min: 1
+    max: 1
