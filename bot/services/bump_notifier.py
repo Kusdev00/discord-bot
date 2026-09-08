@@ -16,7 +16,6 @@ from bot.database.bump_db import (
     get_opted_in_users,
     count_opted_in_users,
 )
-from bot.database.bump_db import CARL_COOLDOWN, DISBOARD_COOLDOWN
 from bot.config.bump_config import CARL_COOLDOWN, DISBOARD_COOLDOWN, SERVICE_CARL, SERVICE_DISBOARD
 from bot.database.bump_db import mark_reminder_sent
 from bot.logging_config import get_logger
