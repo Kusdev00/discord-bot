@@ -66,6 +66,7 @@ class DiscordBot(commands.Bot):
             "bot.cogs.admin",
             "bot.cogs.utils",
             "bot.cogs.inviteblock",
+            "bot.cogs.bump",
         ]
 
         for cog in cogs:

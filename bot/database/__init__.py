@@ -1,0 +1,53 @@
+"""
+Database package initialization.
+"""
+
+from bot.database.bump_db import (
+    init_db,
+    get_guild_settings,
+    update_guild_settings,
+    get_notification_channel,
+    is_guild_enabled,
+    should_mention_users,
+    get_user_preference,
+    set_user_preference,
+    get_user_preference_status,
+    count_opted_in_users,
+    get_opted_in_users,
+    get_bump_state,
+    record_successful_bump,
+    mark_reminder_sent,
+    reset_bump_state,
+    get_all_pending_bumps,
+    get_all_guild_bump_states,
+    simulate_bump,
+    trigger_reminder_now,
+    check_duplicate_bump,
+    get_user_preference_status,
+    count_opted_in_users,
+)
+
+__all__ = [
+    "init_db",
+    "get_guild_settings",
+    "update_guild_settings",
+    "get_notification_channel",
+    "is_guild_enabled",
+    "should_mention_users",
+    "get_user_preference",
+    "set_user_preference",
+    "get_user_preference_status",
+    "count_opted_in_users",
+    "get_opted_in_users",
+    "get_bump_state",
+    "record_successful_bump",
+    "mark_reminder_sent",
+    "reset_bump_state",
+    "get_all_pending_bumps",
+    "get_all_guild_bump_states",
+    "simulate_bump",
+    "trigger_reminder_now",
+    "check_duplicate_bump",
+    "get_user_preference_status",
+    "count_opted_in_users",
+]

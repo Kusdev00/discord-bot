@@ -13,5 +13,27 @@ from config import Config
 
 # Also import welcome_config
 from bot.config.welcome_config import welcome_config
+# Also import bump_config
+from bot.config.bump_config import (
+    CARL_BOT_ID,
+    DISBOARD_BOT_ID,
+    CARL_COOLDOWN,
+    DISBOARD_COOLDOWN,
+    DEFAULT_BUMP_NOTIFICATIONS,
+    MENTION_OPTED_IN_USERS,
+    SERVICE_CARL,
+    SERVICE_DISBOARD,
+)
 
-__all__ = ["Config", "welcome_config"]
+__all__ = [
+    "Config",
+    "welcome_config",
+    "CARL_BOT_ID",
+    "DISBOARD_BOT_ID",
+    "CARL_COOLDOWN",
+    "DISBOARD_COOLDOWN",
+    "DEFAULT_BUMP_NOTIFICATIONS",
+    "MENTION_OPTED_IN_USERS",
+    "SERVICE_CARL",
+    "SERVICE_DISBOARD",
+]

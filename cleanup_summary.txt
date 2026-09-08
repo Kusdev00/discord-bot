@@ -1,0 +1,1 @@
+Discord bot directory cleanup completed. Removed all temporary Python scripts used for message modifications. Core bot files (config.py, main.py) and configuration remain intact.

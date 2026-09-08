@@ -50,10 +50,13 @@ class Config:
     WELCOME_CHANNEL_ID: Optional[int] = _parse_int(os.getenv("WELCOME_CHANNEL_ID"))
     WELCOME_DEFAULT_COLOR: str = os.getenv("WELCOME_DEFAULT_COLOR", "random")
     WELCOME_TEST_CHANNEL_ID: Optional[int] = _parse_int(os.getenv("WELCOME_TEST_CHANNEL_ID"))
+    WELCOME_CONFIG_DIR: Path = PROJECT_ROOT / "data" / "welcome"
+
+    # Bump system
+    BUMP_CONFIG_DIR: Path = PROJECT_ROOT / "data" / "bump"
 
     # Data paths
     DATA_DIR: Path = PROJECT_ROOT / "data"
-    WELCOME_CONFIG_DIR: Path = DATA_DIR / "welcome"
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
@@ -74,6 +77,7 @@ class Config:
         # Ensure data directories exist
         cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
         cls.WELCOME_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        cls.BUMP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         cls.LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     @classmethod
