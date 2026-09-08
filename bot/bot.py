@@ -50,9 +50,13 @@ class DiscordBot(commands.Bot):
         # Sync slash commands
         if Config.TEST_GUILD_ID:
             guild = discord.Object(id=Config.TEST_GUILD_ID)
+            # Copy global commands to test guild and sync ONLY there (not globally)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
-            logger.info("Synced commands to test guild %d", Config.TEST_GUILD_ID)
+            # Clear global commands to avoid duplicates
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            logger.info("Synced commands to test guild %d (global cleared)", Config.TEST_GUILD_ID)
         else:
             await self.tree.sync()
             logger.info("Synced global commands")
