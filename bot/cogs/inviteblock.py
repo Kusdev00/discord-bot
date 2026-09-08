@@ -6,6 +6,7 @@ import re
 import discord
 from discord import app_commands
 from discord.ext import commands
+from typing import Optional
 
 from bot.config import Config
 from bot.logging_config import get_logger
@@ -125,7 +126,7 @@ def extract_invites(text: str) -> list[str]:
     return matches
 
 
-async def resolve_invite(bot: commands.Bot, invite_code: str) -> discord.Invite | None:
+async def resolve_invite(bot: commands.Bot, invite_code: str) -> Optional[discord.Invite]:
     """Try to resolve an invite code to get the target guild ID."""
     try:
         invite = await bot.fetch_invite(invite_code)
