@@ -166,6 +166,14 @@ class BumpCog(commands.Cog):
             service_display = "Carl-bot" if service == "carl" else "Disboard"
 
             bumper = self._find_bumper(message)
+            if bumper is None:
+                # Carl-bot's success embed has no user mention; without interaction
+                # metadata we can't tell who bumped, so no private confirmation.
+                logger.info(
+                    "Recorded %s bump in guild %d but could not identify the bumper; skipping private confirmation",
+                    service,
+                    message.guild.id,
+                )
             if bumper:
                 try:
                     if await get_user_preference(message.guild.id, bumper.id):
