@@ -42,17 +42,6 @@ async def init_db() -> None:
             )
         """)
 
-        # User notification preferences per guild
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bump_users (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                notifications_enabled BOOLEAN DEFAULT TRUE,
-                settings_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, user_id)
-            )
-        """)
-
         # Per-person bump waitlist: everyone who successfully bumps is added
         # and personally pinged in the notification channel when their cooldown
         # (2h Disboard / 6h Carl-bot) expires, then removed.
@@ -115,12 +104,6 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_bump_state_next_available
             ON bump_state (next_bump_available)
             WHERE next_bump_available IS NOT NULL AND reminder_sent = FALSE
-        """)
-
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bump_users_enabled
-            ON bump_users (guild_id, notifications_enabled)
-            WHERE notifications_enabled = TRUE
         """)
 
         await db.commit()
