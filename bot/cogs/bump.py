@@ -120,11 +120,16 @@ class BumpCog(commands.Cog):
                     member = message.guild.get_member(user_id) if message.guild else None
                     return member or self.bot.get_user(user_id)
 
-        # 5. Check reply reference
+        # 5. Check reply reference (Carl-bot replies to the "user used /bump" marker)
         if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
             ref_msg = message.reference.resolved
             if not ref_msg.author.bot:
                 return ref_msg.author
+            # Interaction replies are authored by the bot but carry the invoking user
+            meta = getattr(ref_msg, "interaction_metadata", None) or getattr(ref_msg, "interaction", None)
+            user = getattr(meta, "user", None) if meta else None
+            if user:
+                return user
 
         return None
 

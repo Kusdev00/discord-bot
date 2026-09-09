@@ -5,7 +5,12 @@ Main entry point for the Discord bot.
 import sys
 from bot.bot import bot
 from config import Config
-from bot.logging_config import get_logger
+from bot.logging_config import get_logger, setup_logging
+
+# Configure logging (console + logs/bot.log) BEFORE anything else logs.
+# Without this, only discord.py's internal logger has a handler and every
+# log line from our own code is silently dropped.
+setup_logging()
 
 logger = get_logger(__name__)
 
