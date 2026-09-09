@@ -3,23 +3,19 @@ Bump notification system cog - Python 3.9 compatible.
 """
 
 import discord
-import re
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Union
+from typing import Optional
 
 from bot.config.bump_config import (
     CARL_BOT_ID,
     DISBOARD_BOT_ID,
-    CARL_COOLDOWN,
-    DISBOARD_COOLDOWN,
 )
 from bot.database import (
     get_guild_settings,
     update_guild_settings,
     is_guild_enabled,
-    get_user_preference,
     set_user_preference,
     get_user_preference_status,
     get_bump_state,
@@ -84,57 +80,6 @@ class BumpCog(commands.Cog):
 
     # ==================== EVENT HANDLERS ====================
 
-    def _find_bumper(self, message: discord.Message) -> Optional[Union[discord.Member, discord.User]]:
-        """Find the user who performed the bump from interaction or mentions."""
-        # 1. Check interaction metadata (slash command user)
-        if hasattr(message, "interaction_metadata") and message.interaction_metadata:
-            user = getattr(message.interaction_metadata, "user", None)
-            if user:
-                return user
-
-        # 2. Check interaction attribute
-        if hasattr(message, "interaction") and message.interaction:
-            user = getattr(message.interaction, "user", None)
-            if user:
-                return user
-
-        # 3. Check for user mention in embeds (e.g. Disboard starts with <@123456>, bump done!)
-        for embed in message.embeds:
-            texts = [embed.title, embed.description]
-            if embed.fields:
-                texts.extend(field.value for field in embed.fields)
-            for text in texts:
-                if not text:
-                    continue
-                match = re.search(r"<@!?(\d+)>", text)
-                if match:
-                    user_id = int(match.group(1))
-                    if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
-                        member = message.guild.get_member(user_id) if message.guild else None
-                        return member or self.bot.get_user(user_id)
-
-        # 4. Check for user mention in plain text content
-        if message.content:
-            match = re.search(r"<@!?(\d+)>", message.content)
-            if match:
-                user_id = int(match.group(1))
-                if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
-                    member = message.guild.get_member(user_id) if message.guild else None
-                    return member or self.bot.get_user(user_id)
-
-        # 5. Check reply reference (Carl-bot replies to the "user used /bump" marker)
-        if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-            ref_msg = message.reference.resolved
-            if not ref_msg.author.bot:
-                return ref_msg.author
-            # Interaction replies are authored by the bot but carry the invoking user
-            meta = getattr(ref_msg, "interaction_metadata", None) or getattr(ref_msg, "interaction", None)
-            user = getattr(meta, "user", None) if meta else None
-            if user:
-                return user
-
-        return None
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Listen for successful bumps from Carl-bot and Disboard."""
@@ -185,47 +130,6 @@ class BumpCog(commands.Cog):
             )
             await mark_bump_message_seen(message.guild.id, service, message.id)
             logger.info("Detected successful %s bump in guild %d", service, message.guild.id)
-
-            # Private confirmation for the bumper
-            cooldown_hours = int(CARL_COOLDOWN.total_seconds() // 3600) if service == "carl" else int(DISBOARD_COOLDOWN.total_seconds() // 3600)
-            service_display = "Carl-bot" if service == "carl" else "Disboard"
-
-            bumper = self._find_bumper(message)
-            if bumper is None:
-                # Carl-bot's success embed has no user mention; without interaction
-                # metadata we can't tell who bumped, so no private confirmation.
-                logger.info(
-                    "Recorded %s bump in guild %d but could not identify the bumper; skipping private confirmation",
-                    service,
-                    message.guild.id,
-                )
-            if bumper:
-                try:
-                    if await get_user_preference(message.guild.id, bumper.id):
-                        msg_text = (
-                            f"🔔 **Bump confirmed!** Thanks for bumping **{message.guild.name}** with {service_display}!\n"
-                            f"Since you have bump notifications enabled, you'll be alerted in **{cooldown_hours} hours** when the next bump is ready."
-                        )
-                        # Try DMing the user first (visible only to them)
-                        dm_sent = False
-                        try:
-                            await bumper.send(msg_text)
-                            dm_sent = True
-                            logger.info("Sent private bump confirmation DM to %s (%d)", bumper, bumper.id)
-                        except (discord.Forbidden, discord.HTTPException):
-                            pass
-
-                        # If DMs are closed, send a self-deleting message in the channel
-                        if not dm_sent:
-                            try:
-                                await message.channel.send(
-                                    f"✅ {bumper.mention} Bump confirmed! You'll be alerted in **{cooldown_hours} hours** when it's ready again.",
-                                    delete_after=10,
-                                )
-                            except Exception:
-                                pass
-                except Exception as e:
-                    logger.warning("Could not send bumper confirmation: %s", e)
         else:
             # A bump-related message we didn't classify. Log it so the bot's exact
             # wording can be added to the detection keywords if a real bump slips by.
@@ -429,7 +333,7 @@ class BumpCog(commands.Cog):
     ])
     async def bump_test_cycle(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
         """Simulate a bump with a ~60 second cooldown so the full
-        reminder pipeline (due -> claim -> ping each opted-in user) can be
+        reminder pipeline (due -> claim -> ping the Bump ping role) can be
         tested without waiting the real 2h/6h."""
         await simulate_bump(interaction.guild_id, service.value)
         due = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp())
@@ -438,28 +342,26 @@ class BumpCog(commands.Cog):
         await interaction.response.send_message(
             "🧪 Simulated **{}** bump with a **~1 minute** cooldown.\n"
             "The scheduler (checks every 30s) will fire the reminder in the "
-            "notification channel - watch for individual pings to opted-in users.\n"
+            "notification channel - watch for the @Bump ping.\n"
             "Due at: <t:{}:T>".format(service.value.capitalize(), due),
             ephemeral=True,
         )
 
-    @bump_test_group.command(name="dm", description="Send yourself the private bump confirmation DM")
-    async def bump_test_dm(self, interaction: discord.Interaction) -> None:
-        """Send the user a sample bump confirmation DM so they can verify delivery
-        (works even with closed DMs since this interaction proves DMs are open)."""
-        try:
-            await interaction.user.send(
-                "🔔 **Bump confirmed!** Thanks for bumping **{}**!\n"
-                "This is a test of the private confirmation you'll get after "
-                "bumping - it works! 🎉".format(interaction.guild.name),
-            )
+    @bump_test_group.command(name="ping", description="Send a test @Bump ping reminder now")
+    async def bump_test_ping(self, interaction: discord.Interaction) -> None:
+        """Send a sample reminder pinging the Bump ping role so the guild can
+        verify the ping lands in the notification channel."""
+        from bot.services.bump_notifier import send_test_reminder
+        success = await send_test_reminder(self.bot, interaction.guild_id, "carl")
+        if success:
             await interaction.response.send_message(
-                "✅ Test DM sent - check your private messages!",
+                "✅ Test reminder with @Bump ping sent to the notification channel!",
                 ephemeral=True,
             )
-        except (discord.Forbidden, discord.HTTPException):
+        else:
             await interaction.response.send_message(
-                "❌ Could not DM you - open your DMs (server privacy settings) and try again.",
+                "❌ Failed to send test reminder. Check the notification channel, "
+                "the Bump ping role, and my permissions.",
                 ephemeral=True,
             )
 

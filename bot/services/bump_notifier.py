@@ -1,23 +1,28 @@
 """
 Bump notification scheduler and reminder service - Python 3.9 compatible.
 
+Reminder model (role-based, no DMs):
+- A single pingable role (BUMP_PING_ROLE_ID) is pinged in the notification
+  channel - no per-user pings and no direct messages.
+- Disboard reminder fires every 2 hours after a Disboard bump.
+- When Carl-bot AND Disboard are both due in the same scheduler pass (the
+  6-hour mark when both were bumped together), ONE combined message pings
+  the role for both instead of two separate pings.
+
 Timing guarantees:
 - Timestamps in bump_state are unix epoch seconds, so SQLite comparisons are exact.
 - Each due reminder is atomically *claimed* before sending, so two scheduler
   passes (or two bot instances) can never both send it.
-- Opted-in users are pinged one message per user (rate-limit friendly) instead
-  of one batched mention blob.
-- reminder_sent is only set for a cycle after at least one user was actually
-  pinged or the channel post went out; failed deliveries release the claim so
-  the reminder retries on the next pass.
+- reminder_sent is only set after the message actually went out; failed
+  deliveries release the claim so the reminder retries on the next pass.
 """
 
 import asyncio
-from typing import List, Optional
+from typing import Optional
 
 import discord
 
-from bot.config.bump_config import CARL_COOLDOWN, DISBOARD_COOLDOWN
+from bot.config.bump_config import CARL_COOLDOWN, DISBOARD_COOLDOWN, BUMP_PING_ROLE_ID
 from bot.database.bump_db import (
     get_all_pending_bumps,
     claim_due_reminder,
@@ -25,7 +30,6 @@ from bot.database.bump_db import (
     mark_reminder_sent,
     get_guild_settings,
     get_notification_channel,
-    get_opted_in_users,
 )
 from bot.logging_config import get_logger
 
@@ -33,10 +37,6 @@ logger = get_logger(__name__)
 
 # Check interval in seconds
 CHECK_INTERVAL = 30
-
-# Per-user pings between small pauses (Discord rate limits rapid-fire sends)
-USERS_PER_BURST = 5
-BURST_PAUSE_SECONDS = 1.5
 
 # How long a claim is held while trying to deliver a reminder
 CLAIM_HOLD_SECONDS = 300
@@ -47,11 +47,15 @@ SERVICE_DISPLAY = {
     "disboard": "Disboard",
 }
 
-# Reminder message templates
+# Reminder message templates (the ping role mention is prepended on send)
 REMINDER_TEMPLATES = {
-    "carl": "🔔 **Carl-bot bump is ready!**\n\nYou can bump the server again using `/bump`.",
-    "disboard": "🔔 **Disboard bump is ready!**\n\nYou can bump the server again using `/bump`.",
+    "carl": "🔔 **Carl-bot bump is ready!** Bump the server with `/bump`.",
+    "disboard": "🔔 **Disboard bump is ready!** Bump the server with `/bump`.",
 }
+COMBINED_TEMPLATE = (
+    "🔔 **Carl-bot AND Disboard bumps are both ready!**\n"
+    "Bump the server with `/bump` for each."
+)
 
 
 def cooldown_hours(service: str) -> int:
@@ -119,21 +123,38 @@ class BumpScheduler:
             if not await claim_due_reminder(guild_id, service, CLAIM_HOLD_SECONDS):
                 continue  # not due anymore, already sent, or claimed elsewhere
 
+            # If the OTHER service is also due and claimable right now, claim it
+            # too and send one combined message instead of two separate pings.
+            # (Disboard's 2h cycle and Carl's 6h cycle align on the 6th hour.)
+            other = "disboard" if service == "carl" else "carl"
+            other_claimed = False
+            if any(p["guild_id"] == guild_id and p["service"] == other for p in pending):
+                other_claimed = await claim_due_reminder(guild_id, other, CLAIM_HOLD_SECONDS)
+
+            services = [service, other] if other_claimed else [service]
+
             try:
-                delivered = await self._send_reminder(guild_id, service)
+                delivered = await self._send_reminder(guild_id, services)
             except Exception as e:
                 logger.exception("Error sending %s reminder for guild %d: %s", service, guild_id, e)
                 delivered = False
 
             if delivered:
-                await mark_reminder_sent(guild_id, service)
-                logger.info("Completed %s reminder for guild %d", service, guild_id)
+                for svc in services:
+                    await mark_reminder_sent(guild_id, svc)
+                logger.info(
+                    "Completed %s reminder for guild %d",
+                    "+".join(services),
+                    guild_id,
+                )
             else:
-                # Nothing delivered: release the claim so the next pass retries
+                # Nothing delivered: release the claims so the next pass retries
                 await release_claim(guild_id, service)
+                if other_claimed:
+                    await release_claim(guild_id, other)
                 logger.warning("Could not deliver %s reminder for guild %d; will retry", service, guild_id)
 
-    async def _resolve_channel(self, guild_id: int) -> Optional[discord.abc.Messageable]:
+    async def _resolve_channel(self, guild_id: int) -> Optional[discord.TextChannel]:
         """Resolve the configured notification channel and check permissions."""
         channel_id = await get_notification_channel(guild_id)
         if not channel_id:
@@ -152,82 +173,71 @@ class BumpScheduler:
 
         return channel
 
-    async def _send_reminder(self, guild_id: int, service: str) -> bool:
-        """Deliver a reminder for one due bump cycle. Returns True only if something was sent."""
+    def _build_reminder_embed(self, guild: discord.Guild, services: list) -> discord.Embed:
+        """Build the reminder embed for one or both services."""
+        if len(services) == 2:
+            text = COMBINED_TEMPLATE
+            title = "🔔 Carl-bot + Disboard Bump Ready"
+        else:
+            service = services[0]
+            service_name = SERVICE_DISPLAY.get(service, service.capitalize())
+            text = REMINDER_TEMPLATES.get(
+                service,
+                "🔔 **{} bump is ready!** Bump the server with `/bump`.".format(service.capitalize()),
+            )
+            title = "🔔 {} Bump Ready".format(service_name)
+
+        embed = discord.Embed(
+            description=text,
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_author(name=title)
+        embed.set_footer(text="Guild: {}".format(guild.name))
+        return embed
+
+    async def _send_reminder(self, guild_id: int, services: list) -> bool:
+        """Deliver a reminder pinging the Bump ping role. Returns True only if sent."""
         channel = await self._resolve_channel(guild_id)
         if channel is None:
             return False
 
-        service_name = SERVICE_DISPLAY.get(service, service.capitalize())
-        template = REMINDER_TEMPLATES.get(
-            service,
-            "🔔 **{} bump is ready!**\n\nYou can bump the server again using `/bump`.".format(service.capitalize()),
-        )
+        embed = self._build_reminder_embed(channel.guild, services)
 
-        embed = discord.Embed(
-            description=template,
-            color=discord.Color.blue(),
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.set_author(name="🔔 {} Bump Ready".format(service_name))
-        embed.set_footer(text="Guild: {}".format(channel.guild.name))
+        # Ping the configured role (targeted allowed_mentions so the ping works
+        # even if the role is not mentionable by @everyone).
+        role = channel.guild.get_role(BUMP_PING_ROLE_ID)
+        if role is not None:
+            content = "{} {}".format(role.mention, embed.description)
+            allowed = discord.AllowedMentions(roles=[role], users=False, everyone=False)
+        else:
+            # Role not found in this guild: announce without a ping rather than
+            # dropping the reminder entirely.
+            content = None
+            allowed = discord.AllowedMentions.none()
+            logger.warning(
+                "Bump ping role %d not found in guild %d; sending reminder without a ping",
+                BUMP_PING_ROLE_ID,
+                guild_id,
+            )
 
-        opted_in = await get_opted_in_users(guild_id)
-
-        # Ping each opted-in user in their own message (visible as a personal ping,
-        # no shared batch). Users whose DM/channel context is irrelevant simply get
-        # one ping message each in the notification channel.
-        delivered_any = False
-        if opted_in:
-            delivered_any = await self._ping_users_individually(channel, opted_in, service_name, embed)
-
-        # If nobody was pinged (or mentions are pointless), still post the
-        # channel-level reminder so the server sees the bump is ready.
-        if not delivered_any:
-            try:
-                await channel.send(embed=embed)
-                delivered_any = True
-                logger.info("Sent channel-only %s reminder for guild %d", service, guild_id)
-            except discord.Forbidden:
-                logger.warning("No permission to send reminder in channel %d for guild %d", channel.id, guild_id)
-                return False
-            except discord.HTTPException as e:
-                logger.exception("Failed to send reminder embed for guild %d: %s", guild_id, e)
-                return False
-
-        return delivered_any
-
-    async def _ping_users_individually(
-        self,
-        channel: discord.abc.Messageable,
-        user_ids: List[int],
-        service_name: str,
-        embed: discord.Embed,
-    ) -> bool:
-        """Send one ping per user. Returns True if at least one ping was delivered."""
-        delivered = 0
-        for idx, uid in enumerate(user_ids, 1):
-            try:
-                await channel.send(
-                    content="<@{}> 🔔 **{} bump is ready!** Bump the server with `/bump`.".format(uid, service_name),
-                    silent=True,
-                )
-                delivered += 1
-            except discord.Forbidden:
-                logger.warning("Forbidden pinging user %d in guild channel; skipping", uid)
-            except discord.HTTPException as e:
-                logger.warning("Failed to ping user %d: %s", uid, e)
-
-            # Small pause every burst to stay friendly to rate limits
-            if idx % USERS_PER_BURST == 0 and idx < len(user_ids):
-                await asyncio.sleep(BURST_PAUSE_SECONDS)
-
-        if delivered:
-            logger.info("Pinged %d/%d opted-in users individually", delivered, len(user_ids))
-        return delivered > 0
+        try:
+            await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+            logger.info(
+                "Sent %s reminder (role ping) for guild %d",
+                "+".join(services),
+                guild_id,
+            )
+            return True
+        except discord.Forbidden:
+            logger.warning("No permission to send reminder in channel %d for guild %d", channel.id, guild_id)
+            return False
+        except discord.HTTPException as e:
+            logger.exception("Failed to send reminder for guild %d: %s", guild_id, e)
+            return False
 
 
 async def send_test_reminder(bot, guild_id: int, service: str) -> bool:
     """Send a test reminder immediately (for testing)."""
     scheduler = BumpScheduler(bot)
-    return await scheduler._send_reminder(guild_id, service)
+    return await scheduler._send_reminder(guild_id, [service])

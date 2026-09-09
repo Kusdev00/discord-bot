@@ -9,6 +9,10 @@ from typing import List
 CARL_BOT_ID = 235148962103951360
 DISBOARD_BOT_ID = 302050872383242240
 
+# Role pinged for bump reminders (must be pingable or the bot needs
+# allowed_mentions to ping it - handled in the notifier)
+BUMP_PING_ROLE_ID = 1547316833365926100
+
 # Cooldowns
 CARL_COOLDOWN = timedelta(hours=6)
 DISBOARD_COOLDOWN = timedelta(hours=2)
