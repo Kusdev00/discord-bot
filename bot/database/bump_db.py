@@ -99,7 +99,12 @@ async def get_guild_settings(guild_id: int) -> Dict[str, Any]:
             "SELECT * FROM bump_settings WHERE guild_id = ?", (guild_id,)
         ) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else {
+            if row:
+                d = dict(row)
+                d["enabled"] = bool(d.get("enabled", 1))
+                d["mention_opted_in_users"] = bool(d.get("mention_opted_in_users", 1))
+                return d
+            return {
                 "guild_id": guild_id,
                 "enabled": True,
                 "notification_channel_id": None,
@@ -135,9 +140,9 @@ async def update_guild_settings(
                VALUES (?, ?, ?, ?, ?)""",
             (
                 guild_id,
-                settings["enabled"],
+                1 if settings["enabled"] else 0,
                 settings["notification_channel_id"],
-                settings["mention_opted_in_users"],
+                1 if settings["mention_opted_in_users"] else 0,
                 settings["updated_at"],
             ),
         )
@@ -159,13 +164,13 @@ async def get_notification_channel(guild_id: int) -> Optional[int]:
 async def is_guild_enabled(guild_id: int) -> bool:
     """Check if bump system is enabled for a guild."""
     settings = await get_guild_settings(guild_id)
-    return settings.get("enabled", True)
+    return bool(settings.get("enabled", True))
 
 
 async def should_mention_users(guild_id: int) -> bool:
     """Check if users should be mentioned in notifications."""
     settings = await get_guild_settings(guild_id)
-    return settings.get("mention_opted_in_users", True)
+    return bool(settings.get("mention_opted_in_users", True))
 
 
 # ==================== User Preferences ====================

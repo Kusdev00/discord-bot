@@ -6,8 +6,6 @@ import discord
 import random
 from datetime import datetime
 from typing import Optional
-from config import Config
-from bot.config.welcome_config import welcome_config
 
 # Default welcome messages (used when no custom messages configured)
 DEFAULT_WELCOME_MESSAGES = [

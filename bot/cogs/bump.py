@@ -6,86 +6,85 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional
 
-from bot.config import Config
 from bot.config.bump_config import (
     CARL_BOT_ID,
     DISBOARD_BOT_ID,
-    CARL_COOLDOWN,
-    DISBOARD_COOLDOWN,
-    SERVICE_CARL,
-    SERVICE_DISBOARD,
 )
 from bot.database import (
     get_guild_settings,
     update_guild_settings,
-    get_user_preference,
+    is_guild_enabled,
     set_user_preference,
     get_user_preference_status,
     count_opted_in_users,
-    get_bump_state,
     record_successful_bump,
     reset_bump_state,
+    get_all_pending_bumps,
     get_all_guild_bump_states,
     simulate_bump,
-    trigger_reminder_now,
-    get_all_pending_bumps,
     check_duplicate_bump,
     init_db,
 )
 from bot.services.bump_detector import detect_bump, debug_bump_detection
-from bot.services.bump_notifier import send_test_reminder
+from bot.services.bump_notifier import BumpScheduler
 from bot.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-# Command groups
-bump_notification_group = app_commands.Group(
-    name="bumpnotification",
-    description="Manage your bump notifications",
-    guild_only=True,
-)
-
-bump_config_group = app_commands.Group(
-    name="bumpconfig",
-    description="Configure the bump system",
-    guild_only=True,
-    default_permissions=discord.Permissions(manage_guild=True),
-)
-
-bump_test_group = app_commands.Group(
-    name="bumptest",
-    description="Test bump system (admin only)",
-    guild_only=True,
-    default_permissions=discord.Permissions(administrator=True),
-)
 
 
 class BumpCog(commands.Cog):
     """Bump notification system."""
 
+    # Command groups
+    bump_notification_group = app_commands.Group(
+        name="bumpnotification",
+        description="Manage your bump notifications",
+        guild_only=True,
+    )
+
+    bump_config_group = app_commands.Group(
+        name="bumpconfig",
+        description="Configure the bump system",
+        guild_only=True,
+        default_permissions=discord.Permissions(manage_guild=True),
+    )
+
+    bump_test_group = app_commands.Group(
+        name="bumptest",
+        description="Test bump system (admin only)",
+        guild_only=True,
+        default_permissions=discord.Permissions(administrator=True),
+    )
+
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.scheduler: Optional[BumpScheduler] = None
 
     async def cog_load(self) -> None:
-        """Initialize database when cog loads."""
+        """Initialize database and start scheduler when cog loads."""
         await init_db()
-        logger.info("Bump system database initialized")
+        self.scheduler = BumpScheduler(self.bot)
+        await self.scheduler.start()
+        logger.info("Bump system database initialized and scheduler started")
+
+    async def cog_unload(self) -> None:
+        """Stop scheduler when cog unloads."""
+        if self.scheduler:
+            await self.scheduler.stop()
+        logger.info("Bump scheduler stopped")
 
     # ==================== EVENT HANDLERS ====================
 
     @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
+    async def on_message(self, message: discord.Message) -> None:
         """Listen for successful bumps from Carl-bot and Disboard."""
-        # Ignore bots, DMs, and messages without guild
-        if not message.guild or message.author.bot:
-            # But we DO want to process bot messages from Carl/Disboard
-            if not message.author.bot:
-                return
-
-        # Skip if no guild
         if not message.guild:
+            return
+
+        # Only process messages from Carl-bot or Disboard
+        if message.author.id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
             return
 
         # Check if bump system is enabled for this guild
@@ -109,6 +108,7 @@ class BumpCog(commands.Cog):
                 message.id,
             )
             logger.info("Detected successful %s bump in guild %d", service, message.guild.id)
+
 
     # ==================== USER COMMANDS ====================
 

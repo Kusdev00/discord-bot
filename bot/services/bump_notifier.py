@@ -3,8 +3,7 @@ Bump notification scheduler and reminder service - Python 3.9 compatible.
 """
 
 import asyncio
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import List
 import discord
 from bot.database.bump_db import (
     get_all_pending_bumps,
@@ -14,10 +13,7 @@ from bot.database.bump_db import (
     is_guild_enabled,
     should_mention_users,
     get_opted_in_users,
-    count_opted_in_users,
 )
-from bot.config.bump_config import CARL_COOLDOWN, DISBOARD_COOLDOWN, SERVICE_CARL, SERVICE_DISBOARD
-from bot.database.bump_db import mark_reminder_sent
 from bot.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -192,19 +188,5 @@ class BumpScheduler:
 
 async def send_test_reminder(bot, guild_id: int, service: str) -> bool:
     """Send a test reminder immediately (for testing)."""
-    from bot.database.bump_db import get_notification_channel, is_guild_enabled, should_mention_users, get_opted_in_users
-
-    # Temporarily set up a mock state for testing
-    mock_state = {
-        "guild_id": guild_id,
-        "service": service,
-    }
-
-    # Create a mock bot-like object with get_channel
-    class MockBot:
-        def get_channel(self, channel_id):
-            return bot.get_channel(channel_id)
-
-    mock_bot = MockBot()
-    scheduler = BumpScheduler(mock_bot)
+    scheduler = BumpScheduler(bot)
     return await scheduler._send_reminder({"guild_id": guild_id, "service": service})

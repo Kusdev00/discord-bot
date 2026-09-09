@@ -19,27 +19,27 @@ logger = get_logger(__name__)
 
 # Compile patterns once for performance
 CARL_SUCCESS_PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(kw) for kw in ["bump successful", "successfully bumped", "server bumped", "bump reminder", "next bump"]) + r")\b",
-    re.IGNORECASE
+    r"\b(" + "|".join(re.escape(kw) for kw in CARL_SUCCESS_KEYWORDS) + r")\b",
+    re.IGNORECASE,
 )
 CARL_FAILURE_PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(kw) for kw in ["cooldown", "wait", "try again", "already bumped", "please wait"]) + r")\b",
-    re.IGNORECASE
+    r"\b(" + "|".join(re.escape(kw) for kw in CARL_FAILURE_KEYWORDS) + r")\b",
+    re.IGNORECASE,
 )
 
 DISBOARD_SUCCESS_PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(kw) for kw in ["bump done", "successfully bumped", "server has been bumped", "bump again in", "next bump"]) + r")\b",
-    re.IGNORECASE
+    r"\b(" + "|".join(re.escape(kw) for kw in DISBOARD_SUCCESS_KEYWORDS) + r")\b",
+    re.IGNORECASE,
 )
 DISBOARD_FAILURE_PATTERN = re.compile(
-    r"\b(" + "|".join(re.escape(kw) for kw in ["cooldown", "wait", "try again", "already bumped", "please wait"]) + r")\b",
-    re.IGNORECASE
+    r"\b(" + "|".join(re.escape(kw) for kw in DISBOARD_FAILURE_KEYWORDS) + r")\b",
+    re.IGNORECASE,
 )
 
 
 def is_carl_bump_success(message: discord.Message) -> bool:
     """Determine if a message represents a successful Carl-bot bump."""
-    if message.author.id != 235148962103951360:
+    if message.author.id != CARL_BOT_ID:
         return False
 
     content = message.content.lower()
@@ -72,7 +72,7 @@ def is_carl_bump_success(message: discord.Message) -> bool:
 
 def is_disboard_bump_success(message: discord.Message) -> bool:
     """Determine if a message represents a successful Disboard bump."""
-    if message.author.id != 302050872383242240:
+    if message.author.id != DISBOARD_BOT_ID:
         return False
 
     content = message.content.lower()
@@ -117,8 +117,8 @@ def debug_bump_detection(message: discord.Message) -> dict:
         "author_name": str(message.author),
         "content": message.content[:200],
         "has_embeds": len(message.embeds) > 0,
-        "is_carl": message.author.id == 235148962103951360,
-        "is_disboard": message.author.id == 302050872383242240,
+        "is_carl": message.author.id == CARL_BOT_ID,
+        "is_disboard": message.author.id == DISBOARD_BOT_ID,
         "carl_success": False,
         "disboard_success": False,
         "carl_failure_keywords": [],
@@ -130,12 +130,12 @@ def debug_bump_detection(message: discord.Message) -> dict:
     content = message.content.lower()
 
     # Check failure keywords
-    result["carl_failure_keywords"] = [kw for kw in ["cooldown", "wait", "try again", "already bumped", "please wait"] if kw in content]
-    result["disboard_failure_keywords"] = [kw for kw in ["cooldown", "wait", "try again", "already bumped", "please wait"] if kw in content]
+    result["carl_failure_keywords"] = [kw for kw in CARL_FAILURE_KEYWORDS if kw in content]
+    result["disboard_failure_keywords"] = [kw for kw in DISBOARD_FAILURE_KEYWORDS if kw in content]
 
     # Check success keywords
-    result["carl_success_keywords"] = [kw for kw in ["bump successful", "successfully bumped", "server bumped", "bump reminder", "next bump"] if kw in content]
-    result["disboard_success_keywords"] = [kw for kw in ["bump done", "successfully bumped", "server has been bumped", "bump again in", "next bump"] if kw in content]
+    result["carl_success_keywords"] = [kw for kw in CARL_SUCCESS_KEYWORDS if kw in content]
+    result["disboard_success_keywords"] = [kw for kw in DISBOARD_SUCCESS_KEYWORDS if kw in content]
 
     # Check embeds
     for i, embed in enumerate(message.embeds):

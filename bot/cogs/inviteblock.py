@@ -28,7 +28,6 @@ class InviteBlockConfig:
     """Manages invite block configuration per guild using JSON."""
 
     def __init__(self):
-        import json
         from pathlib import Path
         import sys
         PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -38,7 +37,6 @@ class InviteBlockConfig:
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_config_path(self, guild_id: int):
-        from pathlib import Path
         return self.config_dir / f"inviteblock_{guild_id}.json"
 
     def _get_default_config(self):

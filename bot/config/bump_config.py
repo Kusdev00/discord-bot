@@ -1,9 +1,9 @@
 """
-Bump system configuration and constants.
+Bump system configuration - Python 3.9 compatible.
 """
 
 from datetime import timedelta
-
+from typing import List
 
 # Bot IDs
 CARL_BOT_ID = 235148962103951360
@@ -17,19 +17,20 @@ DISBOARD_COOLDOWN = timedelta(hours=2)
 DEFAULT_BUMP_NOTIFICATIONS = True
 MENTION_OPTED_IN_USERS = True
 
-# Bump service names (for database keys)
+# Service names
 SERVICE_CARL = "carl"
 SERVICE_DISBOARD = "disboard"
 
-# Detection keywords (customizable)
-CARL_SUCCESS_KEYWORDS = [
+# Detection keywords
+CARL_SUCCESS_KEYWORDS: List[str] = [
     "bump successful",
     "successfully bumped",
     "server bumped",
     "bump reminder",
     "next bump",
 ]
-DISBOARD_SUCCESS_KEYWORDS = [
+
+DISBOARD_SUCCESS_KEYWORDS: List[str] = [
     "bump done",
     "successfully bumped",
     "server has been bumped",
@@ -37,15 +38,15 @@ DISBOARD_SUCCESS_KEYWORDS = [
     "next bump",
 ]
 
-# Failure keywords (to avoid false positives)
-CARL_FAILURE_KEYWORDS = [
+CARL_FAILURE_KEYWORDS: List[str] = [
     "cooldown",
     "wait",
     "try again",
     "already bumped",
     "please wait",
 ]
-DISBOARD_FAILURE_KEYWORDS = [
+
+DISBOARD_FAILURE_KEYWORDS: List[str] = [
     "cooldown",
     "wait",
     "try again",
