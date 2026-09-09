@@ -460,6 +460,24 @@ async def simulate_bump(guild_id: int, service: str) -> bool:
     return await record_successful_bump(guild_id, service, datetime.now(timezone.utc))
 
 
+async def set_next_bump_available(guild_id: int, service: str, epoch_seconds: int) -> bool:
+    """Force a cooldown expiry time (unix epoch seconds). Used by test tooling
+    to make a reminder due in seconds instead of the real 2h/6h cooldown."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE bump_state SET next_bump_available = ?, reminder_sent = 0, claim_expires_at = NULL, updated_at = ? WHERE guild_id = ? AND service = ?",
+            (epoch_seconds, int(datetime.now(timezone.utc).timestamp()), guild_id, service),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to set next_bump_available: %s", e)
+        return False
+    finally:
+        await db.close()
+
+
 async def trigger_reminder_now(guild_id: int, service: str) -> bool:
     """Immediately trigger a reminder for testing (doesn't change real cooldown)."""
     # Get current state

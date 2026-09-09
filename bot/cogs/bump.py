@@ -6,7 +6,7 @@ import discord
 import re
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Union
 
 from bot.config.bump_config import (
@@ -22,6 +22,8 @@ from bot.database import (
     get_user_preference,
     set_user_preference,
     get_user_preference_status,
+    get_bump_state,
+    set_next_bump_available,
     count_opted_in_users,
     record_successful_bump,
     mark_bump_message_seen,
@@ -155,9 +157,27 @@ class BumpCog(commands.Cog):
                 logger.debug("Duplicate bump message ignored: %d", message.id)
                 return
 
+            # Cooldown-window guard: a real bump cannot happen twice inside the
+            # service's cooldown (2h Disboard / 6h Carl-bot). Discord mirrors bump
+            # confirmations across channels, so a second copy can arrive as a NEW
+            # message id minutes later - ignore anything inside an active cooldown.
+            bump_time = datetime.now(timezone.utc)
+            state = await get_bump_state(message.guild.id, service)
+            if state and state.get("next_bump_available"):
+                try:
+                    next_available = int(state["next_bump_available"])
+                except (TypeError, ValueError):
+                    next_available = None
+                if next_available and next_available > int(bump_time.timestamp()) - 1:
+                    logger.info(
+                        "Ignored extra %s bump confirmation in guild %d (service on cooldown)",
+                        service,
+                        message.guild.id,
+                    )
+                    return
+
             # Record successful bump (message marked as seen first, so a repost/edit
             # of the bump bot's confirmation can never double-count a bump)
-            bump_time = datetime.now(timezone.utc)
             await record_successful_bump(
                 message.guild.id,
                 service,
@@ -400,6 +420,48 @@ class BumpCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ==================== ADMIN TEST COMMANDS ====================
+
+    @bump_test_group.command(name="cycle", description="Full fast cycle: simulate a bump, reminder due in ~1 minute")
+    @app_commands.describe(service="Which service to simulate")
+    @app_commands.choices(service=[
+        app_commands.Choice(name="Carl-bot", value="carl"),
+        app_commands.Choice(name="Disboard", value="disboard"),
+    ])
+    async def bump_test_cycle(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
+        """Simulate a bump with a ~60 second cooldown so the full
+        reminder pipeline (due -> claim -> ping each opted-in user) can be
+        tested without waiting the real 2h/6h."""
+        await simulate_bump(interaction.guild_id, service.value)
+        due = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp())
+        await set_next_bump_available(interaction.guild_id, service.value, due)
+
+        await interaction.response.send_message(
+            "🧪 Simulated **{}** bump with a **~1 minute** cooldown.\n"
+            "The scheduler (checks every 30s) will fire the reminder in the "
+            "notification channel - watch for individual pings to opted-in users.\n"
+            "Due at: <t:{}:T>".format(service.value.capitalize(), due),
+            ephemeral=True,
+        )
+
+    @bump_test_group.command(name="dm", description="Send yourself the private bump confirmation DM")
+    async def bump_test_dm(self, interaction: discord.Interaction) -> None:
+        """Send the user a sample bump confirmation DM so they can verify delivery
+        (works even with closed DMs since this interaction proves DMs are open)."""
+        try:
+            await interaction.user.send(
+                "🔔 **Bump confirmed!** Thanks for bumping **{}**!\n"
+                "This is a test of the private confirmation you'll get after "
+                "bumping - it works! 🎉".format(interaction.guild.name),
+            )
+            await interaction.response.send_message(
+                "✅ Test DM sent - check your private messages!",
+                ephemeral=True,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message(
+                "❌ Could not DM you - open your DMs (server privacy settings) and try again.",
+                ephemeral=True,
+            )
 
     @bump_test_group.command(name="simulate", description="Simulate a successful bump")
     @app_commands.describe(service="Which service to simulate")
