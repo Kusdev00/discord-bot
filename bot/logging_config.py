@@ -49,10 +49,11 @@ def setup_logging() -> None:
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
 
-    # Set specific loggers
+    # Set specific loggers (keep gateway at INFO so disconnects/reconnects
+    # are visible - a silent zombie connection is very hard to diagnose)
     logging.getLogger("discord").setLevel(logging.INFO)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
-    logging.getLogger("discord.gateway").setLevel(logging.WARNING)
+    logging.getLogger("discord.gateway").setLevel(logging.INFO)
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 

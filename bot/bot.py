@@ -3,6 +3,8 @@ Core bot class with setup, event handling, and cog management.
 """
 
 import discord
+import os
+import time
 from discord.ext import commands
 
 from bot.config import Config
@@ -27,7 +29,14 @@ class DiscordBot(commands.Bot):
             help_command=None,  # We'll implement custom help
             activity=self._get_activity(),
             status=discord.Status.online,
+            heartbeat_timeout=60.0,  # Reconnect if the gateway goes quiet (zombie-connection guard)
         )
+
+        # Watchdog: last time we received ANY traffic from the Discord gateway.
+        # A healthy connection receives frames constantly; a "zombie" connection
+        # keeps the process alive but stops delivering events (messages, commands),
+        # which silently breaks bump detection. Exited so systemd restarts us.
+        self._last_gateway_rx = time.monotonic()
 
     def _get_activity(self) -> discord.Activity:
         """Create activity from config."""
@@ -76,6 +85,10 @@ class DiscordBot(commands.Bot):
             except Exception as e:
                 logger.exception("Failed to load cog %s: %s", cog, e)
 
+    async def on_socket_raw_receive(self, msg) -> None:
+        """Track liveness: any gateway traffic means the connection is real."""
+        self._last_gateway_rx = time.monotonic()
+
     async def on_ready(self) -> None:
         """Called when the bot is ready and connected."""
         logger.info(
@@ -84,6 +97,17 @@ class DiscordBot(commands.Bot):
             self.user.id if self.user else 0,
             len(self.guilds),
         )
+
+        # Zombie connection guard: if ready fired but we have not received a
+        # single gateway frame in over an hour, events are not being delivered.
+        idle = time.monotonic() - self._last_gateway_rx
+        if idle > 3600:
+            logger.error(
+                "No gateway traffic for %.0f minutes - zombie connection detected; "
+                "exiting so systemd restarts the bot with a fresh session",
+                idle / 60,
+            )
+            os._exit(1)
 
         # Log guild info in debug mode
         if Config.DEBUG:
