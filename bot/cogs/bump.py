@@ -207,29 +207,34 @@ class BumpCog(commands.Cog):
             ping_at = int((bump_time + cooldown).timestamp())
 
             bumper = self._find_bumper(message)
+            pathway = "cached reference"
 
             # If _find_bumper couldn't spot the user from the cached reference,
             # try fetching the marker message fresh and re-reading its interaction
             # metadata (Carl-bot replies usually carry a usable reference).
             if bumper is None and message.reference and message.reference.message_id:
                 bumper = await self._resolve_bumper_from_reference(message)
+                pathway = "fresh reference fetch"
 
             if bumper is None:
                 logger.info(
-                    "Recorded %s bump in guild %d but could not identify the bumper; "
-                    "nobody added to the waitlist",
+                    "Recorded %s bump in guild %d but could not identify the bumper "
+                    "(pathway=%s); nobody added to the waitlist",
                     service,
                     message.guild.id,
+                    pathway,
                 )
             else:
                 await add_to_waitlist(message.guild.id, bumper.id, service, ping_at)
                 logger.info(
-                    "Detected %s bump by %s (%d) in guild %d; ping due at %d",
+                    "Detected %s bump by %s (%d) in guild %d; ping due at %d "
+                    "(pathway=%s)",
                     service,
                     bumper,
                     bumper.id,
                     message.guild.id,
                     ping_at,
+                    pathway,
                 )
 
         else:
