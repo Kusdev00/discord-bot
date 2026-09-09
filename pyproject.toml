@@ -23,6 +23,10 @@ dev = [
     "mypy>=1.5.0",
 ]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bot*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"
