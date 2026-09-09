@@ -119,17 +119,34 @@ class BumpCog(commands.Cog):
                     member = message.guild.get_member(user_id) if message.guild else None
                     return member or self.bot.get_user(user_id)
 
-        # 5. Check reply reference (Carl-bot replies to the "user used /bump" marker)
-        if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-            ref_msg = message.reference.resolved
-            if not ref_msg.author.bot:
-                return ref_msg.author
-            # Interaction replies are authored by the bot but carry the invoking user
-            meta = getattr(ref_msg, "interaction_metadata", None) or getattr(ref_msg, "interaction", None)
-            user = getattr(meta, "user", None) if meta else None
-            if user:
-                return user
+        # 5. Carl-bot's successful bump is a reply to the "user used /bump"
+        # marker message, which carries the invoking user in its interaction
+        # metadata. Walk the reply chain until we find a usable identity.
+        reference = message.reference
+        if reference:
+            resolved = reference.resolved
+            if isinstance(resolved, discord.Message):
+                # Direct marker: a real user authored it.
+                if not resolved.author.bot:
+                    return resolved.author
+                # Otherwise the marker itself is a bot message (less common)
+                # but still carries interaction_metadata.
+                meta = getattr(resolved, "interaction_metadata", None)
+                if meta is not None:
+                    user = getattr(meta, "user", None)
+                    if user is not None:
+                        return user
+                # Fallback: some bots attach an 'interaction' object at the top
+                # level.
+                interaction = getattr(resolved, "interaction", None)
+                if interaction is not None:
+                    user = getattr(interaction, "user", None)
+                    if user is not None:
+                        return user
 
+        # 6. We didn't find a usable identity from the cached reference.
+        # returned None + has a reference => let the caller async-fetch the
+        # marker message via _resolve_bumper_from_reference() below.
         return None
 
     @commands.Cog.listener()
@@ -190,6 +207,13 @@ class BumpCog(commands.Cog):
             ping_at = int((bump_time + cooldown).timestamp())
 
             bumper = self._find_bumper(message)
+
+            # If _find_bumper couldn't spot the user from the cached reference,
+            # try fetching the marker message fresh and re-reading its interaction
+            # metadata (Carl-bot replies usually carry a usable reference).
+            if bumper is None and message.reference and message.reference.message_id:
+                bumper = await self._resolve_bumper_from_reference(message)
+
             if bumper is None:
                 logger.info(
                     "Recorded %s bump in guild %d but could not identify the bumper; "
@@ -207,6 +231,7 @@ class BumpCog(commands.Cog):
                     message.guild.id,
                     ping_at,
                 )
+
         else:
             # A bump-related message we didn't classify. Log it so the bot's exact
             # wording can be added to the detection keywords if a real bump slips by.
@@ -221,6 +246,41 @@ class BumpCog(commands.Cog):
                     message.author,
                     " ".join(combined.split())[:200],
                 )
+
+
+    async def _resolve_bumper_from_reference(self, message: discord.Message) -> Optional[Union[discord.Member, discord.User]]:
+        """Fetch the referenced message fresh and read the invoking user out of it."""
+        reference = message.reference
+        channel = getattr(message, "channel", None)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return None
+
+        try:
+            ref_msg = await channel.fetch_message(reference.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+
+        if not isinstance(ref_msg, discord.Message):
+            return None
+
+        # Marker authored by a real user -> that's the bumper.
+        if not ref_msg.author.bot:
+            return ref_msg.author
+
+        # Otherwise read interaction_metadata.user (carried by Carl-bot's reply).
+        meta = getattr(ref_msg, "interaction_metadata", None)
+        if meta is not None:
+            user = getattr(meta, "user", None)
+            if user is not None:
+                return user
+
+        interaction = getattr(ref_msg, "interaction", None)
+        if interaction is not None:
+            user = getattr(interaction, "user", None)
+            if user is not None:
+                return user
+
+        return None
 
 
     # ==================== USER COMMANDS ====================
