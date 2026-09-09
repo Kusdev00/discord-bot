@@ -5,7 +5,7 @@ Embed building utilities for the welcome system.
 import discord
 import random
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 # Default welcome messages (used when no custom messages configured)
 DEFAULT_WELCOME_MESSAGES = [
@@ -211,7 +211,7 @@ def create_welcome_config_embed(
 
 def create_welcome_list_embed(
     title: str,
-    items: list[str],
+    items: List[str],
     item_type: str,
     guild: discord.Guild,
 ) -> discord.Embed:
@@ -225,16 +225,24 @@ def create_welcome_list_embed(
     if not items:
         embed.description = f"No custom {item_type} configured. Using defaults."
     else:
-        # Format items with numbers
+        # Format items with numbers, guarding against Discord's 4096 character limit
         description = ""
         for i, item in enumerate(items, 1):
             if item_type == "images":
                 # For images, show as clickable link with preview
-                description += f"`{i}.` [Image Link]({item})\n"
+                line = f"`{i}.` [Image {i}]({item})\n"
             else:
                 # For messages, truncate long ones
                 display = item[:100] + "..." if len(item) > 100 else item
-                description += f"`{i}.` {display}\n"
+                line = f"`{i}.` {display}\n"
+
+            if len(description) + len(line) > 3900:
+                remaining = len(items) - i + 1
+                description += f"\n*...and {remaining} more {item_type} (Discord character limit reached)*"
+                break
+
+            description += line
+
         embed.description = description
 
     embed.set_footer(

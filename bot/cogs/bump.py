@@ -3,10 +3,11 @@ Bump notification system cog - Python 3.9 compatible.
 """
 
 import discord
+import re
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Union
 
 from bot.config.bump_config import (
     CARL_BOT_ID,
@@ -16,6 +17,7 @@ from bot.database import (
     get_guild_settings,
     update_guild_settings,
     is_guild_enabled,
+    get_user_preference,
     set_user_preference,
     get_user_preference_status,
     count_opted_in_users,
@@ -77,6 +79,55 @@ class BumpCog(commands.Cog):
 
     # ==================== EVENT HANDLERS ====================
 
+    def _find_bumper(self, message: discord.Message) -> Optional[Union[discord.Member, discord.User]]:
+        """Find the user who performed the bump from interaction or mentions."""
+        # 1. Check interaction metadata (slash command user)
+        if hasattr(message, "interaction_metadata") and message.interaction_metadata:
+            user = getattr(message.interaction_metadata, "user", None)
+            if user:
+                return user
+
+        # 2. Check interaction attribute
+        if hasattr(message, "interaction") and message.interaction:
+            user = getattr(message.interaction, "user", None)
+            if user:
+                return user
+
+        # 3. Check for user mention in embeds (e.g. Disboard starts with <@123456>, bump done!)
+        for embed in message.embeds:
+            if embed.description:
+                match = re.search(r"<@!?(\d+)>", embed.description)
+                if match:
+                    user_id = int(match.group(1))
+                    if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
+                        member = message.guild.get_member(user_id) if message.guild else None
+                        return member or self.bot.get_user(user_id)
+            if embed.fields:
+                for field in embed.fields:
+                    match = re.search(r"<@!?(\d+)>", field.value)
+                    if match:
+                        user_id = int(match.group(1))
+                        if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
+                            member = message.guild.get_member(user_id) if message.guild else None
+                            return member or self.bot.get_user(user_id)
+
+        # 4. Check for user mention in plain text content
+        if message.content:
+            match = re.search(r"<@!?(\d+)>", message.content)
+            if match:
+                user_id = int(match.group(1))
+                if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
+                    member = message.guild.get_member(user_id) if message.guild else None
+                    return member or self.bot.get_user(user_id)
+
+        # 5. Check reply reference
+        if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+            ref_msg = message.reference.resolved
+            if not ref_msg.author.bot:
+                return ref_msg.author
+
+        return None
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Listen for successful bumps from Carl-bot and Disboard."""
@@ -109,6 +160,39 @@ class BumpCog(commands.Cog):
             )
             logger.info("Detected successful %s bump in guild %d", service, message.guild.id)
 
+            # Alert opted-in bumper
+            cooldown_hours = 6 if service == "carl" else 2
+            service_display = "Carl-bot" if service == "carl" else "Disboard"
+
+            bumper = self._find_bumper(message)
+            if bumper:
+                try:
+                    if await get_user_preference(message.guild.id, bumper.id):
+                        msg_text = (
+                            f"🔔 **Bump confirmed!** Thanks for bumping **{message.guild.name}** with {service_display}!\n"
+                            f"Since you have bump notifications enabled, you'll be alerted in **{cooldown_hours} hours** when the next bump is ready."
+                        )
+                        # Try DMing the user first (visible only to them)
+                        dm_sent = False
+                        try:
+                            await bumper.send(msg_text)
+                            dm_sent = True
+                            logger.info("Sent private bump confirmation DM to %s (%d)", bumper, bumper.id)
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+
+                        # If DMs are closed, send a self-deleting message in the channel
+                        if not dm_sent:
+                            try:
+                                await message.channel.send(
+                                    f"✅ {bumper.mention} Bump confirmed! You'll be alerted in **{cooldown_hours} hours** when it's ready again.",
+                                    delete_after=10,
+                                )
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning("Could not send bumper confirmation: %s", e)
+
 
     # ==================== USER COMMANDS ====================
 
@@ -134,8 +218,8 @@ class BumpCog(commands.Cog):
     async def bump_notification_status(self, interaction: discord.Interaction) -> None:
         """Show your current notification status."""
         status = await get_user_preference_status(interaction.guild_id, interaction.user.id)
-        enabled = status["enabled"]
-        updated = status["settings_updated_at"]
+        enabled = status.get("enabled", True)
+        updated = status.get("settings_updated_at") or status.get("updated_at")
 
         embed = discord.Embed(
             title="🔔 Your Bump Notification Status",
@@ -147,12 +231,17 @@ class BumpCog(commands.Cog):
             value="🟢 **Enabled**" if enabled else "🔴 **Disabled**",
             inline=True,
         )
-        if status["settings_updated_at"]:
-            embed.add_field(
-                name="Last Changed",
-                value="<t:{}:R>".format(int(datetime.fromisoformat(status['settings_updated_at'].replace('Z', '+00:00')).timestamp())),
-                inline=True,
-            )
+        if updated:
+            try:
+                ts = int(datetime.fromisoformat(str(updated).replace('Z', '+00:00')).timestamp())
+                embed.add_field(
+                    name="Last Changed",
+                    value=f"<t:{ts}:R>",
+                    inline=True,
+                )
+            except Exception:
+                pass
+
         embed.set_footer(text="User: {}".format(interaction.user), icon_url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

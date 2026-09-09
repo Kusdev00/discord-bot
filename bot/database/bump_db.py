@@ -232,11 +232,17 @@ async def get_user_preference_status(guild_id: int, user_id: int) -> Dict[str, A
         ) as cursor:
             row = await cursor.fetchone()
             if row:
+                timestamp = row["settings_updated_at"]
                 return {
                     "enabled": bool(row["notifications_enabled"]),
-                    "updated_at": row["settings_updated_at"],
+                    "updated_at": timestamp,
+                    "settings_updated_at": timestamp,
                 }
-            return {"enabled": True, "settings_updated_at": None}
+            return {
+                "enabled": True,
+                "updated_at": None,
+                "settings_updated_at": None,
+            }
     finally:
         await db.close()
 
