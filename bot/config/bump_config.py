@@ -28,6 +28,9 @@ CARL_SUCCESS_KEYWORDS: List[str] = [
     "server bumped",
     "bump reminder",
     "next bump",
+    "bump done",
+    "bumped the server",
+    "bump complete",
 ]
 
 DISBOARD_SUCCESS_KEYWORDS: List[str] = [

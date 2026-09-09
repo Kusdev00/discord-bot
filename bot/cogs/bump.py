@@ -98,21 +98,18 @@ class BumpCog(commands.Cog):
 
         # 3. Check for user mention in embeds (e.g. Disboard starts with <@123456>, bump done!)
         for embed in message.embeds:
-            if embed.description:
-                match = re.search(r"<@!?(\d+)>", embed.description)
+            texts = [embed.title, embed.description]
+            if embed.fields:
+                texts.extend(field.value for field in embed.fields)
+            for text in texts:
+                if not text:
+                    continue
+                match = re.search(r"<@!?(\d+)>", text)
                 if match:
                     user_id = int(match.group(1))
                     if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
                         member = message.guild.get_member(user_id) if message.guild else None
                         return member or self.bot.get_user(user_id)
-            if embed.fields:
-                for field in embed.fields:
-                    match = re.search(r"<@!?(\d+)>", field.value)
-                    if match:
-                        user_id = int(match.group(1))
-                        if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
-                            member = message.guild.get_member(user_id) if message.guild else None
-                            return member or self.bot.get_user(user_id)
 
         # 4. Check for user mention in plain text content
         if message.content:
@@ -196,6 +193,20 @@ class BumpCog(commands.Cog):
                                 pass
                 except Exception as e:
                     logger.warning("Could not send bumper confirmation: %s", e)
+        else:
+            # A bump-related message we didn't classify. Log it so the bot's exact
+            # wording can be added to the detection keywords if a real bump slips by.
+            texts = [message.content or ""]
+            for embed in message.embeds:
+                texts.extend([embed.title or "", embed.description or ""])
+                texts.extend(field.value or "" for field in embed.fields)
+            combined = " ".join(texts)
+            if "bump" in combined.lower():
+                logger.info(
+                    "Ignoring %s message mentioning bump without a success match: %s",
+                    message.author,
+                    " ".join(combined.split())[:200],
+                )
 
 
     # ==================== USER COMMANDS ====================

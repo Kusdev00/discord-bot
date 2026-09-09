@@ -68,6 +68,14 @@ async def init_db() -> None:
             )
         """)
 
+        # Upgrade tables created by older versions: CREATE TABLE IF NOT EXISTS
+        # does not add columns to an existing table.
+        try:
+            await db.execute("ALTER TABLE bump_state ADD COLUMN claim_expires_at INTEGER")
+            logger.info("Added claim_expires_at column to existing bump_state table")
+        except Exception:
+            logger.debug("claim_expires_at column already present")
+
         # Migration: convert legacy ISO-8601 timestamps to unix epoch seconds.
         # Python 3.9 sqlite can't compare mixed types, which made reminders fire
         # at the wrong time. Bump state rows are transient (per cooldown cycle)
