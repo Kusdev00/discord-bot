@@ -410,11 +410,7 @@ class BumpCog(commands.Cog):
                 display = "Carl-bot" if e["service"] == "carl" else "Disboard"
                 member = interaction.guild.get_member(e["user_id"])
                 if member:
-                    name = "{}{} {}".format(
-                        member.mention,
-                        "👑" if member.guild_permissions.administrator else "",
-                        member.display_name,
-                    )
+                    name = "{}: {}".format(member.mention, member.display_name)
                 else:
                     name = "<@{}> (left guild)".format(e["user_id"])
 
