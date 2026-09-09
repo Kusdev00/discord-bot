@@ -12,6 +12,8 @@ from typing import Optional, Union
 from bot.config.bump_config import (
     CARL_BOT_ID,
     DISBOARD_BOT_ID,
+    CARL_COOLDOWN,
+    DISBOARD_COOLDOWN,
 )
 from bot.database import (
     get_guild_settings,
@@ -22,11 +24,12 @@ from bot.database import (
     get_user_preference_status,
     count_opted_in_users,
     record_successful_bump,
+    mark_bump_message_seen,
+    check_duplicate_bump,
     reset_bump_state,
     get_all_pending_bumps,
     get_all_guild_bump_states,
     simulate_bump,
-    check_duplicate_bump,
     init_db,
 )
 from bot.services.bump_detector import detect_bump, debug_bump_detection
@@ -150,18 +153,19 @@ class BumpCog(commands.Cog):
                 logger.debug("Duplicate bump message ignored: %d", message.id)
                 return
 
-            # Record successful bump
+            # Record successful bump (message marked as seen first, so a repost/edit
+            # of the bump bot's confirmation can never double-count a bump)
             bump_time = datetime.now(timezone.utc)
             await record_successful_bump(
                 message.guild.id,
                 service,
                 bump_time,
-                message.id,
             )
+            await mark_bump_message_seen(message.guild.id, service, message.id)
             logger.info("Detected successful %s bump in guild %d", service, message.guild.id)
 
-            # Alert opted-in bumper
-            cooldown_hours = 6 if service == "carl" else 2
+            # Private confirmation for the bumper
+            cooldown_hours = int(CARL_COOLDOWN.total_seconds() // 3600) if service == "carl" else int(DISBOARD_COOLDOWN.total_seconds() // 3600)
             service_display = "Carl-bot" if service == "carl" else "Disboard"
 
             bumper = self._find_bumper(message)
@@ -339,7 +343,7 @@ class BumpCog(commands.Cog):
             inline=True,
         )
 
-        # Show cooldown status
+        # Show cooldown status (epoch timestamps in bump_state)
         states = await get_all_guild_bump_states(interaction.guild_id)
         for service in ["carl", "disboard"]:
             state = states.get(service)
@@ -347,12 +351,11 @@ class BumpCog(commands.Cog):
                 next_available = state.get("next_bump_available")
                 reminder_sent = state.get("reminder_sent", False)
                 if next_available:
-                    next_time = datetime.fromisoformat(next_available.replace('Z', '+00:00'))
                     embed.add_field(
                         name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
                         value=(
                             "Next: <t:{}:R>\n"
-                            "Reminder: {}".format(int(next_time.timestamp()), "✅ Sent" if reminder_sent else "⏳ Pending")
+                            "Reminder: {}".format(int(next_available), "✅ Sent" if reminder_sent else "⏳ Pending")
                         ),
                         inline=True,
                     )
@@ -513,12 +516,10 @@ class BumpCog(commands.Cog):
                 value_lines = []
 
                 if last_bump:
-                    last_time = datetime.fromisoformat(last_bump.replace('Z', '+00:00'))
-                    value_lines.append("Last: <t:{}:R>".format(int(last_time.timestamp())))
+                    value_lines.append("Last: <t:{}:R>".format(int(last_bump)))
 
                 if next_available:
-                    next_time = datetime.fromisoformat(next_available.replace('Z', '+00:00'))
-                    value_lines.append("Next: <t:{}:R>".format(int(next_time.timestamp())))
+                    value_lines.append("Next: <t:{}:R>".format(int(next_available)))
 
                 value_lines.append("Reminder: {}".format("✅ Sent" if reminder_sent else "⏳ Pending"))
 

@@ -53,19 +53,38 @@ async def init_db() -> None:
             )
         """)
 
-        # Bump state per guild per service
+        # Bump state per guild per service (timestamps stored as unix epoch seconds)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bump_state (
                 guild_id INTEGER NOT NULL,
                 service TEXT NOT NULL,
-                last_successful_bump TIMESTAMP,
-                next_bump_available TIMESTAMP,
+                last_successful_bump INTEGER,
+                next_bump_available INTEGER,
                 reminder_sent BOOLEAN DEFAULT FALSE,
+                claim_expires_at INTEGER,
                 last_processed_message_id INTEGER,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at INTEGER,
                 PRIMARY KEY (guild_id, service)
             )
         """)
+
+        # Migration: convert legacy ISO-8601 timestamps to unix epoch seconds.
+        # Python 3.9 sqlite can't compare mixed types, which made reminders fire
+        # at the wrong time. Bump state rows are transient (per cooldown cycle)
+        # so resetting them is safe.
+        try:
+            async with db.execute(
+                "SELECT COUNT(*) FROM bump_state WHERE typeof(next_bump_available) = 'text'"
+            ) as cursor:
+                (legacy_count,) = await cursor.fetchone()
+            if legacy_count:
+                await db.execute("DELETE FROM bump_state WHERE typeof(next_bump_available) = 'text'")
+                logger.info("Migrated %d legacy bump_state rows to epoch timestamps", legacy_count)
+        except Exception as e:
+            logger.warning("bump_state timestamp migration check failed: %s", e)
+
+        # Recreate index if it was built against the legacy schema
+        await db.execute("DROP INDEX IF EXISTS idx_bump_state_next_available")
 
         # Create indexes for efficient queries
         await db.execute("""
@@ -283,7 +302,7 @@ async def record_successful_bump(
     bump_time: datetime,
     message_id: Optional[int] = None,
 ) -> bool:
-    """Record a successful bump and update cooldown."""
+    """Record a successful bump and update cooldown (epoch-second timestamps)."""
     # Import here to avoid circular imports
     from bot.config.bump_config import CARL_COOLDOWN, DISBOARD_COOLDOWN
 
@@ -294,15 +313,15 @@ async def record_successful_bump(
     try:
         await db.execute(
             """INSERT OR REPLACE INTO bump_state
-               (guild_id, service, last_successful_bump, next_bump_available, reminder_sent, last_processed_message_id, updated_at)
-               VALUES (?, ?, ?, ?, FALSE, ?, ?)""",
+               (guild_id, service, last_successful_bump, next_bump_available, reminder_sent, claim_expires_at, last_processed_message_id, updated_at)
+               VALUES (?, ?, ?, ?, FALSE, NULL, ?, ?)""",
             (
                 guild_id,
                 service,
-                bump_time.isoformat(),
-                next_available.isoformat(),
+                int(bump_time.timestamp()),
+                int(next_available.timestamp()),
                 message_id,
-                datetime.now(timezone.utc).isoformat(),
+                int(datetime.now(timezone.utc).timestamp()),
             ),
         )
         await db.commit()
@@ -315,13 +334,60 @@ async def record_successful_bump(
         await db.close()
 
 
+async def claim_due_reminder(guild_id: int, service: str, hold_seconds: int = 300) -> bool:
+    """Atomically claim a due reminder so concurrent schedulers can't double-send.
+
+    Returns True if this call won the claim. The claim is stored as an epoch
+    expiry and naturally releases (or can be re-claimed) once it lapses.
+    """
+    now = int(datetime.now(timezone.utc).timestamp())
+    db = await get_db()
+    try:
+        await db.execute(
+            """UPDATE bump_state
+               SET claim_expires_at = ?, updated_at = ?
+               WHERE guild_id = ?
+                 AND service = ?
+                 AND next_bump_available IS NOT NULL
+                 AND next_bump_available <= ?
+                 AND reminder_sent = FALSE
+                 AND last_successful_bump IS NOT NULL
+                 AND (claim_expires_at IS NULL OR claim_expires_at <= ?)""",
+            (now + hold_seconds, now, guild_id, service, now, now),
+        )
+        await db.commit()
+        return db.total_changes > 0
+    except Exception as e:
+        logger.exception("Failed to claim reminder: %s", e)
+        return False
+    finally:
+        await db.close()
+
+
+async def release_claim(guild_id: int, service: str) -> bool:
+    """Release a previously claimed reminder so it can be retried later."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE bump_state SET claim_expires_at = NULL, updated_at = ? WHERE guild_id = ? AND service = ?",
+            (int(datetime.now(timezone.utc).timestamp()), guild_id, service),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to release reminder claim: %s", e)
+        return False
+    finally:
+        await db.close()
+
+
 async def mark_reminder_sent(guild_id: int, service: str) -> bool:
     """Mark that the reminder has been sent for the current cycle."""
     db = await get_db()
     try:
         await db.execute(
-            "UPDATE bump_state SET reminder_sent = 1, updated_at = ? WHERE guild_id = ? AND service = ?",
-            (datetime.now(timezone.utc).isoformat(), guild_id, service),
+            "UPDATE bump_state SET reminder_sent = 1, claim_expires_at = NULL, updated_at = ? WHERE guild_id = ? AND service = ?",
+            (int(datetime.now(timezone.utc).timestamp()), guild_id, service),
         )
         await db.commit()
         return True
@@ -353,14 +419,14 @@ async def get_all_pending_bumps() -> List[Dict[str, Any]]:
     """Get all bump states where cooldown has expired but reminder not sent."""
     db = await get_db()
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now = int(datetime.now(timezone.utc).timestamp())
         async with db.execute(
             """SELECT * FROM bump_state
                WHERE next_bump_available IS NOT NULL
                AND next_bump_available <= ?
                AND reminder_sent = FALSE
                AND last_successful_bump IS NOT NULL""",
-            (datetime.now(timezone.utc).isoformat(),),
+            (now,),
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -393,14 +459,15 @@ async def trigger_reminder_now(guild_id: int, service: str) -> bool:
     if not state:
         return False
 
-    # Temporarily set next_bump_available to now
+    # Temporarily set next_bump_available to now (epoch seconds)
     db = await get_db()
     try:
+        now = int(datetime.now(timezone.utc).timestamp())
         await db.execute(
             "UPDATE bump_state SET next_bump_available = ?, reminder_sent = 0, updated_at = ? WHERE guild_id = ? AND service = ?",
             (
-                datetime.now(timezone.utc).isoformat(),
-                datetime.now(timezone.utc).isoformat(),
+                now,
+                now,
                 guild_id,
                 service,
             ),
@@ -409,6 +476,27 @@ async def trigger_reminder_now(guild_id: int, service: str) -> bool:
         return True
     except Exception as e:
         logger.exception("Failed to trigger reminder: %s", e)
+        return False
+    finally:
+        await db.close()
+
+
+async def mark_bump_message_seen(guild_id: int, service: str, message_id: int) -> bool:
+    """Mark a bump bot message as processed immediately.
+
+    Bump bots may repost or edit their confirmation message; marking the id
+    before any follow-up work prevents double-recording a bump.
+    """
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE bump_state SET last_processed_message_id = ?, updated_at = ? WHERE guild_id = ? AND service = ?",
+            (message_id, int(datetime.now(timezone.utc).timestamp()), guild_id, service),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to mark bump message seen: %s", e)
         return False
     finally:
         await db.close()
