@@ -29,7 +29,6 @@ from bot.database import (
     add_to_waitlist,
     get_guild_waitlist,
     clear_guild_waitlist,
-    set_next_bump_available,
     init_db,
 )
 from bot.services.bump_detector import detect_bump, debug_bump_detection
@@ -226,8 +225,8 @@ class BumpCog(commands.Cog):
 
     # ==================== USER COMMANDS ====================
 
-    @bump_notification_group.command(name="me", description="Check your personal bump waitlist status")
-    async def bump_notification_me(self, interaction: discord.Interaction) -> None:
+    @bump_notification_group.command(name="status", description="Check your personal bump waitlist status")
+    async def bump_notification_status(self, interaction: discord.Interaction) -> None:
         """Show the user's entries on the bump waitlist."""
         entries = await get_guild_waitlist(interaction.guild_id)
         mine = [e for e in entries if e["user_id"] == interaction.user.id]
@@ -300,22 +299,6 @@ class BumpCog(commands.Cog):
             ephemeral=True,
         )
 
-    @bump_config_group.command(name="mentions", description="Toggle mentioning opted-in users")
-    @app_commands.describe(state="Enable or disable user mentions in notifications")
-    @app_commands.choices(state=[
-        app_commands.Choice(name="Enable", value="on"),
-        app_commands.Choice(name="Disable", value="off"),
-    ])
-    async def bump_config_mentions(self, interaction: discord.Interaction, state: app_commands.Choice[str]) -> None:
-        """Toggle whether to mention opted-in users in notifications."""
-        enabled = state.value == "on"
-        await update_guild_settings(interaction.guild_id, mention_opted_in_users=enabled)
-
-        await interaction.response.send_message(
-            "✅ User mentions in bump notifications **{}**".format("enabled" if enabled else "disabled"),
-            ephemeral=True,
-        )
-
     @bump_config_group.command(name="view", description="View current bump configuration")
     async def bump_config_view(self, interaction: discord.Interaction) -> None:
         """View current bump configuration."""
@@ -355,35 +338,6 @@ class BumpCog(commands.Cog):
             "in the notification channel when their cooldown (6h Carl-bot / "
             "2h Disboard) expires, then removed from the list."
         )
-
-        # Show cooldown status (epoch timestamps in bump_state)
-        states = await get_all_guild_bump_states(interaction.guild_id)
-        for service in ["carl", "disboard"]:
-            state = states.get(service)
-            if state:
-                next_available = state.get("next_bump_available")
-                reminder_sent = state.get("reminder_sent", False)
-                if next_available:
-                    embed.add_field(
-                        name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
-                        value=(
-                            "Next: <t:{}:R>\n"
-                            "Reminder: {}".format(int(next_available), "✅ Sent" if reminder_sent else "⏳ Pending")
-                        ),
-                        inline=True,
-                    )
-                else:
-                    embed.add_field(
-                        name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
-                        value="⏳ No bump recorded yet",
-                        inline=True,
-                    )
-            else:
-                embed.add_field(
-                    name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
-                    value="⏳ No bump recorded yet",
-                    inline=True,
-                )
 
         embed.set_footer(text="Guild: {}".format(interaction.guild.name), icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -425,54 +379,6 @@ class BumpCog(commands.Cog):
         else:
             await interaction.response.send_message(
                 "❌ Failed to send sample ping. Check the notification channel and my permissions.",
-                ephemeral=True,
-            )
-
-    @bump_test_group.command(name="simulate", description="Simulate a successful bump")
-    @app_commands.describe(service="Which service to simulate")
-    @app_commands.choices(service=[
-        app_commands.Choice(name="Carl-bot", value="carl"),
-        app_commands.Choice(name="Disboard", value="disboard"),
-    ])
-    async def bump_test_simulate(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
-        """Simulate a successful bump: record state and put the invoking user
-        on the waitlist with the real cooldown."""
-        await simulate_bump(interaction.guild_id, service.value)
-
-        cooldown = CARL_COOLDOWN if service.value == "carl" else DISBOARD_COOLDOWN
-        ping_at = int((datetime.now(timezone.utc) + cooldown).timestamp())
-        await add_to_waitlist(interaction.guild_id, interaction.user.id, service.value, ping_at)
-
-        hours = int(cooldown.total_seconds() // 3600)
-        await interaction.response.send_message(
-            "✅ Simulated successful **{}** bump - **you** are on the waitlist.\n"
-            "You'll be pinged in the notification channel in **{} hours** "
-            "(<t:{}:R>), then removed from the list.".format(
-                service.value.capitalize(),
-                hours,
-                ping_at,
-            ),
-            ephemeral=True,
-        )
-
-    @bump_test_group.command(name="reminder", description="Send a test reminder immediately")
-    @app_commands.describe(service="Which reminder to test")
-    @app_commands.choices(service=[
-        app_commands.Choice(name="Carl-bot", value="carl"),
-        app_commands.Choice(name="Disboard", value="disboard"),
-    ])
-    async def bump_test_reminder(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
-        """Send a sample personal ping immediately without changing the waitlist."""
-        from bot.services.bump_notifier import send_test_ping
-        success = await send_test_ping(self.bot, interaction.guild_id, interaction.user.id, service.value)
-        if success:
-            await interaction.response.send_message(
-                "✅ Sample **{}** ping sent to the notification channel!".format(service.value.capitalize()),
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ Failed to send sample ping. Check notification channel and permissions.",
                 ephemeral=True,
             )
 

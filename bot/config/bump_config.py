@@ -17,14 +17,6 @@ BUMP_PING_ROLE_ID = 1547316833365926100
 CARL_COOLDOWN = timedelta(hours=6)
 DISBOARD_COOLDOWN = timedelta(hours=2)
 
-# Defaults
-DEFAULT_BUMP_NOTIFICATIONS = True
-MENTION_OPTED_IN_USERS = True
-
-# Service names
-SERVICE_CARL = "carl"
-SERVICE_DISBOARD = "disboard"
-
 # Detection keywords
 CARL_SUCCESS_KEYWORDS: List[str] = [
     "bump successful",

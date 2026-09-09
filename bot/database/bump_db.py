@@ -210,100 +210,6 @@ async def is_guild_enabled(guild_id: int) -> bool:
     return bool(settings.get("enabled", True))
 
 
-async def should_mention_users(guild_id: int) -> bool:
-    """Check if users should be mentioned in notifications."""
-    settings = await get_guild_settings(guild_id)
-    return bool(settings.get("mention_opted_in_users", True))
-
-
-# ==================== User Preferences ====================
-
-async def get_user_preference(guild_id: int, user_id: int) -> bool:
-    """Get user's notification preference (defaults to True)."""
-    db = await get_db()
-    try:
-        async with db.execute(
-            "SELECT notifications_enabled FROM bump_users WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return bool(row["notifications_enabled"]) if row else True
-    finally:
-        await db.close()
-
-
-async def set_user_preference(guild_id: int, user_id: int, enabled: bool) -> bool:
-    """Set user's notification preference."""
-    db = await get_db()
-    try:
-        await db.execute(
-            """INSERT OR REPLACE INTO bump_users
-               (guild_id, user_id, notifications_enabled, settings_updated_at)
-               VALUES (?, ?, ?, ?)""",
-            (guild_id, user_id, 1 if enabled else 0, datetime.now(timezone.utc).isoformat()),
-        )
-        await db.commit()
-        return True
-    except Exception as e:
-        logger.exception("Failed to set user preference: %s", e)
-        return False
-    finally:
-        await db.close()
-
-
-async def get_opted_in_users(guild_id: int) -> List[int]:
-    """Get all user IDs with notifications enabled in a guild."""
-    db = await get_db()
-    try:
-        async with db.execute(
-            "SELECT user_id FROM bump_users WHERE guild_id = ? AND notifications_enabled = 1",
-            (guild_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [row["user_id"] for row in rows]
-    finally:
-        await db.close()
-
-
-async def get_user_preference_status(guild_id: int, user_id: int) -> Dict[str, Any]:
-    """Get user's preference status for display."""
-    db = await get_db()
-    try:
-        async with db.execute(
-            "SELECT notifications_enabled, settings_updated_at FROM bump_users WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                timestamp = row["settings_updated_at"]
-                return {
-                    "enabled": bool(row["notifications_enabled"]),
-                    "updated_at": timestamp,
-                    "settings_updated_at": timestamp,
-                }
-            return {
-                "enabled": True,
-                "updated_at": None,
-                "settings_updated_at": None,
-            }
-    finally:
-        await db.close()
-
-
-async def count_opted_in_users(guild_id: int) -> int:
-    """Count users with notifications enabled."""
-    db = await get_db()
-    try:
-        async with db.execute(
-            "SELECT COUNT(*) as count FROM bump_users WHERE guild_id = ? AND notifications_enabled = 1",
-            (guild_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row["count"] if row else 0
-    finally:
-        await db.close()
-
-
 # ==================== Bump State ====================
 
 async def get_bump_state(guild_id: int, service: str) -> Optional[Dict[str, Any]]:
@@ -358,70 +264,6 @@ async def record_successful_bump(
         await db.close()
 
 
-async def claim_due_reminder(guild_id: int, service: str, hold_seconds: int = 300) -> bool:
-    """Atomically claim a due reminder so concurrent schedulers can't double-send.
-
-    Returns True if this call won the claim. The claim is stored as an epoch
-    expiry and naturally releases (or can be re-claimed) once it lapses.
-    """
-    now = int(datetime.now(timezone.utc).timestamp())
-    db = await get_db()
-    try:
-        await db.execute(
-            """UPDATE bump_state
-               SET claim_expires_at = ?, updated_at = ?
-               WHERE guild_id = ?
-                 AND service = ?
-                 AND next_bump_available IS NOT NULL
-                 AND next_bump_available <= ?
-                 AND reminder_sent = FALSE
-                 AND last_successful_bump IS NOT NULL
-                 AND (claim_expires_at IS NULL OR claim_expires_at <= ?)""",
-            (now + hold_seconds, now, guild_id, service, now, now),
-        )
-        await db.commit()
-        return db.total_changes > 0
-    except Exception as e:
-        logger.exception("Failed to claim reminder: %s", e)
-        return False
-    finally:
-        await db.close()
-
-
-async def release_claim(guild_id: int, service: str) -> bool:
-    """Release a previously claimed reminder so it can be retried later."""
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE bump_state SET claim_expires_at = NULL, updated_at = ? WHERE guild_id = ? AND service = ?",
-            (int(datetime.now(timezone.utc).timestamp()), guild_id, service),
-        )
-        await db.commit()
-        return True
-    except Exception as e:
-        logger.exception("Failed to release reminder claim: %s", e)
-        return False
-    finally:
-        await db.close()
-
-
-async def mark_reminder_sent(guild_id: int, service: str) -> bool:
-    """Mark that the reminder has been sent for the current cycle."""
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE bump_state SET reminder_sent = 1, claim_expires_at = NULL, updated_at = ? WHERE guild_id = ? AND service = ?",
-            (int(datetime.now(timezone.utc).timestamp()), guild_id, service),
-        )
-        await db.commit()
-        return True
-    except Exception as e:
-        logger.exception("Failed to mark reminder sent: %s", e)
-        return False
-    finally:
-        await db.close()
-
-
 async def reset_bump_state(guild_id: int, service: str) -> bool:
     """Reset bump state for a service (for testing)."""
     db = await get_db()
@@ -435,25 +277,6 @@ async def reset_bump_state(guild_id: int, service: str) -> bool:
     except Exception as e:
         logger.exception("Failed to reset bump state: %s", e)
         return False
-    finally:
-        await db.close()
-
-
-async def get_all_pending_bumps() -> List[Dict[str, Any]]:
-    """Get all bump states where cooldown has expired but reminder not sent."""
-    db = await get_db()
-    try:
-        now = int(datetime.now(timezone.utc).timestamp())
-        async with db.execute(
-            """SELECT * FROM bump_state
-               WHERE next_bump_available IS NOT NULL
-               AND next_bump_available <= ?
-               AND reminder_sent = FALSE
-               AND last_successful_bump IS NOT NULL""",
-            (now,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
     finally:
         await db.close()
 
@@ -474,53 +297,6 @@ async def get_all_guild_bump_states(guild_id: int) -> Dict[str, Dict[str, Any]]:
 async def simulate_bump(guild_id: int, service: str) -> bool:
     """Simulate a successful bump for testing."""
     return await record_successful_bump(guild_id, service, datetime.now(timezone.utc))
-
-
-async def set_next_bump_available(guild_id: int, service: str, epoch_seconds: int) -> bool:
-    """Force a cooldown expiry time (unix epoch seconds). Used by test tooling
-    to make a reminder due in seconds instead of the real 2h/6h cooldown."""
-    db = await get_db()
-    try:
-        await db.execute(
-            "UPDATE bump_state SET next_bump_available = ?, reminder_sent = 0, claim_expires_at = NULL, updated_at = ? WHERE guild_id = ? AND service = ?",
-            (epoch_seconds, int(datetime.now(timezone.utc).timestamp()), guild_id, service),
-        )
-        await db.commit()
-        return True
-    except Exception as e:
-        logger.exception("Failed to set next_bump_available: %s", e)
-        return False
-    finally:
-        await db.close()
-
-
-async def trigger_reminder_now(guild_id: int, service: str) -> bool:
-    """Immediately trigger a reminder for testing (doesn't change real cooldown)."""
-    # Get current state
-    state = await get_bump_state(guild_id, service)
-    if not state:
-        return False
-
-    # Temporarily set next_bump_available to now (epoch seconds)
-    db = await get_db()
-    try:
-        now = int(datetime.now(timezone.utc).timestamp())
-        await db.execute(
-            "UPDATE bump_state SET next_bump_available = ?, reminder_sent = 0, updated_at = ? WHERE guild_id = ? AND service = ?",
-            (
-                now,
-                now,
-                guild_id,
-                service,
-            ),
-        )
-        await db.commit()
-        return True
-    except Exception as e:
-        logger.exception("Failed to trigger reminder: %s", e)
-        return False
-    finally:
-        await db.close()
 
 
 async def mark_bump_message_seen(guild_id: int, service: str, message_id: int) -> bool:
