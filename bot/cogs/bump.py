@@ -3,31 +3,33 @@ Bump notification system cog - Python 3.9 compatible.
 """
 
 import discord
+import re
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Union
 
 from bot.config.bump_config import (
     CARL_BOT_ID,
     DISBOARD_BOT_ID,
+    CARL_COOLDOWN,
+    DISBOARD_COOLDOWN,
 )
 from bot.database import (
     get_guild_settings,
     update_guild_settings,
     is_guild_enabled,
-    set_user_preference,
-    get_user_preference_status,
     get_bump_state,
-    set_next_bump_available,
-    count_opted_in_users,
     record_successful_bump,
     mark_bump_message_seen,
     check_duplicate_bump,
     reset_bump_state,
-    get_all_pending_bumps,
     get_all_guild_bump_states,
     simulate_bump,
+    add_to_waitlist,
+    get_guild_waitlist,
+    clear_guild_waitlist,
+    set_next_bump_available,
     init_db,
 )
 from bot.services.bump_detector import detect_bump, debug_bump_detection
@@ -80,6 +82,57 @@ class BumpCog(commands.Cog):
 
     # ==================== EVENT HANDLERS ====================
 
+    def _find_bumper(self, message: discord.Message) -> Optional[Union[discord.Member, discord.User]]:
+        """Find the user who performed the bump from interaction or mentions."""
+        # 1. Check interaction metadata (slash command user)
+        if hasattr(message, "interaction_metadata") and message.interaction_metadata:
+            user = getattr(message.interaction_metadata, "user", None)
+            if user:
+                return user
+
+        # 2. Check interaction attribute
+        if hasattr(message, "interaction") and message.interaction:
+            user = getattr(message.interaction, "user", None)
+            if user:
+                return user
+
+        # 3. Check for user mention in embeds (e.g. Disboard starts with <@123456>, bump done!)
+        for embed in message.embeds:
+            texts = [embed.title, embed.description]
+            if embed.fields:
+                texts.extend(field.value for field in embed.fields)
+            for text in texts:
+                if not text:
+                    continue
+                match = re.search(r"<@!?(\d+)>", text)
+                if match:
+                    user_id = int(match.group(1))
+                    if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
+                        member = message.guild.get_member(user_id) if message.guild else None
+                        return member or self.bot.get_user(user_id)
+
+        # 4. Check for user mention in plain text content
+        if message.content:
+            match = re.search(r"<@!?(\d+)>", message.content)
+            if match:
+                user_id = int(match.group(1))
+                if user_id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
+                    member = message.guild.get_member(user_id) if message.guild else None
+                    return member or self.bot.get_user(user_id)
+
+        # 5. Check reply reference (Carl-bot replies to the "user used /bump" marker)
+        if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+            ref_msg = message.reference.resolved
+            if not ref_msg.author.bot:
+                return ref_msg.author
+            # Interaction replies are authored by the bot but carry the invoking user
+            meta = getattr(ref_msg, "interaction_metadata", None) or getattr(ref_msg, "interaction", None)
+            user = getattr(meta, "user", None) if meta else None
+            if user:
+                return user
+
+        return None
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Listen for successful bumps from Carl-bot and Disboard."""
@@ -102,34 +155,59 @@ class BumpCog(commands.Cog):
                 logger.debug("Duplicate bump message ignored: %d", message.id)
                 return
 
-            # Cooldown-window guard: a real bump cannot happen twice inside the
-            # service's cooldown (2h Disboard / 6h Carl-bot). Discord mirrors bump
-            # confirmations across channels, so a second copy can arrive as a NEW
-            # message id minutes later - ignore anything inside an active cooldown.
             bump_time = datetime.now(timezone.utc)
-            state = await get_bump_state(message.guild.id, service)
-            if state and state.get("next_bump_available"):
-                try:
-                    next_available = int(state["next_bump_available"])
-                except (TypeError, ValueError):
-                    next_available = None
-                if next_available and next_available > int(bump_time.timestamp()) - 1:
-                    logger.info(
-                        "Ignored extra %s bump confirmation in guild %d (service on cooldown)",
-                        service,
-                        message.guild.id,
-                    )
-                    return
 
-            # Record successful bump (message marked as seen first, so a repost/edit
-            # of the bump bot's confirmation can never double-count a bump)
-            await record_successful_bump(
-                message.guild.id,
-                service,
-                bump_time,
-            )
+            # Disboard's cooldown is SERVER-WIDE: only one bump per 2 hours.
+            # Discord mirrors its confirmation across channels, so a second copy
+            # can arrive as a NEW message id minutes later - ignore anything
+            # inside the active cooldown. (Carl-bot is per-user, so its state
+            # must never gate new bumpers - anyone may /bump at any time.)
+            if service == "disboard":
+                state = await get_bump_state(message.guild.id, service)
+                if state and state.get("next_bump_available"):
+                    try:
+                        next_available = int(state["next_bump_available"])
+                    except (TypeError, ValueError):
+                        next_available = None
+                    if next_available and next_available > int(bump_time.timestamp()) - 1:
+                        logger.info(
+                            "Ignored extra %s bump confirmation in guild %d (service on cooldown)",
+                            service,
+                            message.guild.id,
+                        )
+                        return
+
+            # Record the server-level state (used for status displays and the
+            # Disboard cooldown guard) and mark the message seen so a repost or
+            # edit of the confirmation can never double-count a bump.
+            await record_successful_bump(message.guild.id, service, bump_time)
             await mark_bump_message_seen(message.guild.id, service, message.id)
-            logger.info("Detected successful %s bump in guild %d", service, message.guild.id)
+
+            # Put the bumper on the personal waitlist: they get pinged in the
+            # notification channel when THEIR cooldown (2h/6h) expires, then
+            # removed from the list.
+            cooldown = CARL_COOLDOWN if service == "carl" else DISBOARD_COOLDOWN
+            service_display = "Carl-bot" if service == "carl" else "Disboard"
+            ping_at = int((bump_time + cooldown).timestamp())
+
+            bumper = self._find_bumper(message)
+            if bumper is None:
+                logger.info(
+                    "Recorded %s bump in guild %d but could not identify the bumper; "
+                    "nobody added to the waitlist",
+                    service,
+                    message.guild.id,
+                )
+            else:
+                await add_to_waitlist(message.guild.id, bumper.id, service, ping_at)
+                logger.info(
+                    "Detected %s bump by %s (%d) in guild %d; ping due at %d",
+                    service,
+                    bumper,
+                    bumper.id,
+                    message.guild.id,
+                    ping_at,
+                )
         else:
             # A bump-related message we didn't classify. Log it so the bot's exact
             # wording can be added to the detection keywords if a real bump slips by.
@@ -148,51 +226,38 @@ class BumpCog(commands.Cog):
 
     # ==================== USER COMMANDS ====================
 
-    @bump_notification_group.command(name="on", description="Enable bump notifications for you")
-    async def bump_notification_on(self, interaction: discord.Interaction) -> None:
-        """Enable bump notifications for the user."""
-        await set_user_preference(interaction.guild_id, interaction.user.id, True)
-        await interaction.response.send_message(
-            "✅ **Bump notifications enabled!** You'll be mentioned when bumps are ready.",
-            ephemeral=True,
-        )
-
-    @bump_notification_group.command(name="off", description="Disable bump notifications for you")
-    async def bump_notification_off(self, interaction: discord.Interaction) -> None:
-        """Disable bump notifications for the user."""
-        await set_user_preference(interaction.guild_id, interaction.user.id, False)
-        await interaction.response.send_message(
-            "✅ **Bump notifications disabled.** You won't be mentioned for bump reminders.",
-            ephemeral=True,
-        )
-
-    @bump_notification_group.command(name="status", description="Check your bump notification status")
-    async def bump_notification_status(self, interaction: discord.Interaction) -> None:
-        """Show your current notification status."""
-        status = await get_user_preference_status(interaction.guild_id, interaction.user.id)
-        enabled = status.get("enabled", True)
-        updated = status.get("settings_updated_at") or status.get("updated_at")
+    @bump_notification_group.command(name="me", description="Check your personal bump waitlist status")
+    async def bump_notification_me(self, interaction: discord.Interaction) -> None:
+        """Show the user's entries on the bump waitlist."""
+        entries = await get_guild_waitlist(interaction.guild_id)
+        mine = [e for e in entries if e["user_id"] == interaction.user.id]
 
         embed = discord.Embed(
-            title="🔔 Your Bump Notification Status",
-            color=discord.Color.blue() if enabled else discord.Color.orange(),
+            title="🔔 Your Bump Waitlist Status",
+            color=discord.Color.blue() if mine else discord.Color.orange(),
             timestamp=discord.utils.utcnow(),
         )
-        embed.add_field(
-            name="Status",
-            value="🟢 **Enabled**" if enabled else "🔴 **Disabled**",
-            inline=True,
-        )
-        if updated:
-            try:
-                ts = int(datetime.fromisoformat(str(updated).replace('Z', '+00:00')).timestamp())
-                embed.add_field(
-                    name="Last Changed",
-                    value=f"<t:{ts}:R>",
-                    inline=True,
-                )
-            except Exception:
-                pass
+
+        if mine:
+            lines = []
+            for e in mine:
+                display = "Carl-bot" if e["service"] == "carl" else "Disboard"
+                lines.append("**{}**: ping <t:{}:R>".format(display, int(e["ping_at"])))
+            embed.add_field(
+                name="Waiting ({} entries)".format(len(mine)),
+                value="\n".join(lines),
+                inline=False,
+            )
+            embed.description = (
+                "Bump with Carl-bot or Disboard and you'll be pinged here "
+                "when your personal cooldown (6h Carl / 2h Disboard) is up."
+            )
+        else:
+            embed.description = (
+                "You're not on the waitlist. **Bump the server** with `/bump` "
+                "(Carl-bot) or Disboard's bump to get on it - you'll be pinged "
+                "when your cooldown (6h Carl / 2h Disboard) expires."
+            )
 
         embed.set_footer(text="User: {}".format(interaction.user), icon_url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -258,8 +323,8 @@ class BumpCog(commands.Cog):
         channel_id = settings.get("notification_channel_id")
         channel = interaction.guild.get_channel(channel_id) if channel_id else None
 
-        # Get user counts
-        opted_in = await count_opted_in_users(interaction.guild_id)
+        # Waitlist summary
+        waitlist = await get_guild_waitlist(interaction.guild_id)
 
         embed = discord.Embed(
             title="🔔 Bump System Configuration",
@@ -280,15 +345,15 @@ class BumpCog(commands.Cog):
         )
 
         embed.add_field(
-            name="👤 User Mentions",
-            value="🟢 Enabled" if settings.get("mention_opted_in_users", True) else "🔴 Disabled",
+            name="👥 On Waitlist",
+            value=str(len(waitlist)),
             inline=True,
         )
 
-        embed.add_field(
-            name="👥 Opted-in Users",
-            value=str(await count_opted_in_users(interaction.guild_id)),
-            inline=True,
+        embed.description = (
+            "Everyone who bumps gets on the waitlist and is pinged personally "
+            "in the notification channel when their cooldown (6h Carl-bot / "
+            "2h Disboard) expires, then removed from the list."
         )
 
         # Show cooldown status (epoch timestamps in bump_state)
@@ -325,43 +390,41 @@ class BumpCog(commands.Cog):
 
     # ==================== ADMIN TEST COMMANDS ====================
 
-    @bump_test_group.command(name="cycle", description="Full fast cycle: simulate a bump, reminder due in ~1 minute")
+    @bump_test_group.command(name="cycle", description="Full fast cycle: put YOU on the waitlist, ping in ~1 minute")
     @app_commands.describe(service="Which service to simulate")
     @app_commands.choices(service=[
         app_commands.Choice(name="Carl-bot", value="carl"),
         app_commands.Choice(name="Disboard", value="disboard"),
     ])
     async def bump_test_cycle(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
-        """Simulate a bump with a ~60 second cooldown so the full
-        reminder pipeline (due -> claim -> ping the Bump ping role) can be
-        tested without waiting the real 2h/6h."""
-        await simulate_bump(interaction.guild_id, service.value)
+        """Simulate the invoking user bumping, with a ~60 second waitlist timer
+        so the full pipeline (waitlist -> due -> claim -> personal ping ->
+        removal) can be tested without waiting the real 2h/6h."""
         due = int((datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp())
-        await set_next_bump_available(interaction.guild_id, service.value, due)
+        await add_to_waitlist(interaction.guild_id, interaction.user.id, service.value, due)
 
         await interaction.response.send_message(
-            "🧪 Simulated **{}** bump with a **~1 minute** cooldown.\n"
-            "The scheduler (checks every 30s) will fire the reminder in the "
-            "notification channel - watch for the @Bump ping.\n"
-            "Due at: <t:{}:T>".format(service.value.capitalize(), due),
+            "🧪 Put **you** on the waitlist for a simulated **{}** bump.\n"
+            "The scheduler (checks every 30s) will ping you personally in the "
+            "notification channel in ~1 minute, then remove you from the list.\n"
+            "Ping due at: <t:{}:T>".format(service.value.capitalize(), due),
             ephemeral=True,
         )
 
-    @bump_test_group.command(name="ping", description="Send a test @Bump ping reminder now")
+    @bump_test_group.command(name="ping", description="Send a sample personal bump ping now")
     async def bump_test_ping(self, interaction: discord.Interaction) -> None:
-        """Send a sample reminder pinging the Bump ping role so the guild can
-        verify the ping lands in the notification channel."""
-        from bot.services.bump_notifier import send_test_reminder
-        success = await send_test_reminder(self.bot, interaction.guild_id, "carl")
+        """Send a sample personal ping so the user can verify the reminder
+        format without changing the waitlist."""
+        from bot.services.bump_notifier import send_test_ping
+        success = await send_test_ping(self.bot, interaction.guild_id, interaction.user.id, "carl")
         if success:
             await interaction.response.send_message(
-                "✅ Test reminder with @Bump ping sent to the notification channel!",
+                "✅ Sample ping sent to the notification channel - check it!",
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                "❌ Failed to send test reminder. Check the notification channel, "
-                "the Bump ping role, and my permissions.",
+                "❌ Failed to send sample ping. Check the notification channel and my permissions.",
                 ephemeral=True,
             )
 
@@ -372,14 +435,22 @@ class BumpCog(commands.Cog):
         app_commands.Choice(name="Disboard", value="disboard"),
     ])
     async def bump_test_simulate(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
-        """Simulate a successful bump for testing."""
+        """Simulate a successful bump: record state and put the invoking user
+        on the waitlist with the real cooldown."""
         await simulate_bump(interaction.guild_id, service.value)
+
+        cooldown = CARL_COOLDOWN if service.value == "carl" else DISBOARD_COOLDOWN
+        ping_at = int((datetime.now(timezone.utc) + cooldown).timestamp())
+        await add_to_waitlist(interaction.guild_id, interaction.user.id, service.value, ping_at)
+
+        hours = int(cooldown.total_seconds() // 3600)
         await interaction.response.send_message(
-            "✅ Simulated successful **{}** bump!\n"
-            "Cooldown set for {} hours.\n"
-            "Reminder will be sent when cooldown expires.".format(
+            "✅ Simulated successful **{}** bump - **you** are on the waitlist.\n"
+            "You'll be pinged in the notification channel in **{} hours** "
+            "(<t:{}:R>), then removed from the list.".format(
                 service.value.capitalize(),
-                6 if service.value == "carl" else 2
+                hours,
+                ping_at,
             ),
             ephemeral=True,
         )
@@ -391,17 +462,17 @@ class BumpCog(commands.Cog):
         app_commands.Choice(name="Disboard", value="disboard"),
     ])
     async def bump_test_reminder(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
-        """Send a test reminder immediately without changing cooldown."""
-        from bot.services.bump_notifier import send_test_reminder
-        success = await send_test_reminder(self.bot, interaction.guild_id, service.value)
+        """Send a sample personal ping immediately without changing the waitlist."""
+        from bot.services.bump_notifier import send_test_ping
+        success = await send_test_ping(self.bot, interaction.guild_id, interaction.user.id, service.value)
         if success:
             await interaction.response.send_message(
-                "✅ Test **{}** reminder sent to notification channel!".format(service.value.capitalize()),
+                "✅ Sample **{}** ping sent to the notification channel!".format(service.value.capitalize()),
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                "❌ Failed to send test reminder. Check notification channel and permissions.",
+                "❌ Failed to send sample ping. Check notification channel and permissions.",
                 ephemeral=True,
             )
 
@@ -457,7 +528,6 @@ class BumpCog(commands.Cog):
         """Show detailed bump system status for administrators."""
         settings = await get_guild_settings(interaction.guild_id)
         states = await get_all_guild_bump_states(interaction.guild_id)
-        opted_in_count = await count_opted_in_users(interaction.guild_id)
 
         embed = discord.Embed(
             title="🔔 Bump System Status",
@@ -479,59 +549,43 @@ class BumpCog(commands.Cog):
             inline=True,
         )
 
-        embed.add_field(
-            name="👤 Mentions",
-            value="🟢 Enabled" if settings.get("mention_opted_in_users", True) else "🔴 Disabled",
-            inline=True,
-        )
+        # Per-person waitlist
+        waitlist = await get_guild_waitlist(interaction.guild_id)
+        if waitlist:
+            lines = []
+            for e in waitlist[:15]:
+                display = "Carl-bot" if e["service"] == "carl" else "Disboard"
+                member = interaction.guild.get_member(e["user_id"])
+                name = member.mention if member else "<@{}>".format(e["user_id"])
+                lines.append("{} - {}: ping <t:{}:R>".format(name, display, int(e["ping_at"])))
+            if len(waitlist) > 15:
+                lines.append("*...and {} more*".format(len(waitlist) - 15))
+            embed.add_field(
+                name="⏳ Waitlist ({} waiting)".format(len(waitlist)),
+                value="\n".join(lines)[:1024],
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="⏳ Waitlist",
+                value="Empty - bump to get on it",
+                inline=False,
+            )
 
-        embed.add_field(
-            name="👥 Opted In",
-            value=str(await count_opted_in_users(interaction.guild_id)),
-            inline=True,
-        )
-
-        # Service status
+        # Server-level last-bump state (informational; Disboard cooldown guard)
+        state_lines = []
         for service in ["carl", "disboard"]:
             state = states.get(service)
             display_name = "Carl-bot" if service == "carl" else "Disboard"
-
-            if state:
-                next_available = state.get("next_bump_available")
-                last_bump = state.get("last_successful_bump")
-                reminder_sent = state.get("reminder_sent", False)
-
-                value_lines = []
-
-                if last_bump:
-                    value_lines.append("Last: <t:{}:R>".format(int(last_bump)))
-
-                if next_available:
-                    value_lines.append("Next: <t:{}:R>".format(int(next_available)))
-
-                value_lines.append("Reminder: {}".format("✅ Sent" if reminder_sent else "⏳ Pending"))
-
-                embed.add_field(
-                    name=display_name,
-                    value="\n".join(value_lines),
-                    inline=True,
-                )
+            if state and state.get("last_successful_bump"):
+                state_lines.append("{}: last bump <t:{}:R>".format(display_name, int(state["last_successful_bump"])))
             else:
-                embed.add_field(
-                    name=display_name,
-                    value="⏳ No bump recorded yet",
-                    inline=True,
-                )
-
-        # Pending reminders
-        pending = await get_all_pending_bumps()
-        guild_pending = [p for p in pending if p["guild_id"] == interaction.guild_id]
-        if guild_pending:
-            embed.add_field(
-                name="⏳ Pending Reminders",
-                value="\n".join("{}: ready".format(p['service'].capitalize()) for p in guild_pending),
-                inline=False,
-            )
+                state_lines.append("{}: no bump recorded".format(display_name))
+        embed.add_field(
+            name="📊 Last Bumps",
+            value="\n".join(state_lines),
+            inline=False,
+        )
 
         embed.set_footer(text="Guild: {}".format(interaction.guild.name))
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -548,6 +602,15 @@ class BumpCog(commands.Cog):
         await interaction.response.send_message(
             "⚠️ Reset **{}** bump state for this server.\n"
             "Cooldown cleared, next bump available immediately.".format(service.value.capitalize()),
+            ephemeral=True,
+        )
+
+    @bump_test_group.command(name="clearwaitlist", description="Remove everyone from the bump waitlist")
+    async def bump_test_clearwaitlist(self, interaction: discord.Interaction) -> None:
+        """Clear the whole waitlist (e.g. after a notification-channel mixup)."""
+        removed = await clear_guild_waitlist(interaction.guild_id)
+        await interaction.response.send_message(
+            "🗑️ Removed **{}** entr{} from the waitlist.".format(removed, "y" if removed == 1 else "ies"),
             ephemeral=True,
         )
 

@@ -53,6 +53,22 @@ async def init_db() -> None:
             )
         """)
 
+        # Per-person bump waitlist: everyone who successfully bumps is added
+        # and personally pinged in the notification channel when their cooldown
+        # (2h Disboard / 6h Carl-bot) expires, then removed.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bump_waitlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                service TEXT NOT NULL,
+                ping_at INTEGER NOT NULL,
+                claim_expires_at INTEGER,
+                created_at INTEGER,
+                UNIQUE (guild_id, user_id, service)
+            )
+        """)
+
         # Bump state per guild per service (timestamps stored as unix epoch seconds)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bump_state (
@@ -534,3 +550,132 @@ async def check_duplicate_bump(guild_id: int, service: str, message_id: int) -> 
     if state and state.get("last_processed_message_id") == message_id:
         return True
     return False
+
+
+# ==================== Bump Waitlist (per-person) ====================
+
+async def add_to_waitlist(guild_id: int, user_id: int, service: str, ping_at: int) -> bool:
+    """Add a bumper to the per-person waitlist.
+
+    If the user is already queued for this service (e.g. two bump bot mirrors
+    of the same bump), the newest cooldown wins.
+    """
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO bump_waitlist (guild_id, user_id, service, ping_at, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (guild_id, user_id, service)
+               DO UPDATE SET ping_at = excluded.ping_at, claim_expires_at = NULL, created_at = excluded.created_at""",
+            (guild_id, user_id, service, int(ping_at), int(datetime.now(timezone.utc).timestamp())),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to add (%d, %d, %s) to bump waitlist: %s", guild_id, user_id, service, e)
+        return False
+    finally:
+        await db.close()
+
+
+async def get_due_waitlist() -> List[Dict[str, Any]]:
+    """Get all waitlist entries whose ping time has arrived."""
+    db = await get_db()
+    try:
+        now = int(datetime.now(timezone.utc).timestamp())
+        async with db.execute(
+            """SELECT * FROM bump_waitlist
+               WHERE ping_at <= ?
+                 AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+               ORDER BY ping_at ASC""",
+            (now, now),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def claim_waitlist_entry(entry_id: int, hold_seconds: int = 300) -> bool:
+    """Atomically claim a waitlist entry so concurrent scheduler passes can't
+    double-ping. Returns True if this call won the claim."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    db = await get_db()
+    try:
+        await db.execute(
+            """UPDATE bump_waitlist SET claim_expires_at = ?
+               WHERE id = ?
+                 AND ping_at <= ?
+                 AND (claim_expires_at IS NULL OR claim_expires_at <= ?)""",
+            (now + hold_seconds, entry_id, now, now),
+        )
+        await db.commit()
+        return db.total_changes > 0
+    except Exception as e:
+        logger.exception("Failed to claim waitlist entry %d: %s", entry_id, e)
+        return False
+    finally:
+        await db.close()
+
+
+async def release_waitlist_entry(entry_id: int) -> bool:
+    """Release a claimed waitlist entry so the next pass retries it."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE bump_waitlist SET claim_expires_at = NULL WHERE id = ?",
+            (entry_id,),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to release waitlist entry %d: %s", entry_id, e)
+        return False
+    finally:
+        await db.close()
+
+
+async def remove_from_waitlist(entry_id: int) -> bool:
+    """Delete a waitlist entry after its ping was delivered."""
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM bump_waitlist WHERE id = ?", (entry_id,))
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to remove waitlist entry %d: %s", entry_id, e)
+        return False
+    finally:
+        await db.close()
+
+
+async def get_guild_waitlist(guild_id: int) -> List[Dict[str, Any]]:
+    """Get all waitlist entries for a guild (for status display)."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            """SELECT * FROM bump_waitlist WHERE guild_id = ? ORDER BY ping_at ASC""",
+            (guild_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def clear_guild_waitlist(guild_id: int) -> int:
+    """Delete all waitlist entries for a guild. Returns how many were removed."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) AS c FROM bump_waitlist WHERE guild_id = ?", (guild_id,)
+        ) as cursor:
+            (count,) = await cursor.fetchone()
+        await db.execute("DELETE FROM bump_waitlist WHERE guild_id = ?", (guild_id,))
+        await db.commit()
+        return count
+    except Exception as e:
+        logger.exception("Failed to clear waitlist for guild %d: %s", guild_id, e)
+        return 0
+    finally:
+        await db.close()
