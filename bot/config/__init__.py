@@ -17,7 +17,6 @@ from bot.config.welcome_config import welcome_config
 from bot.config.bump_config import (
     CARL_BOT_ID,
     DISBOARD_BOT_ID,
-    BUMP_PING_ROLE_ID,
     CARL_COOLDOWN,
     DISBOARD_COOLDOWN,
     CARL_SUCCESS_KEYWORDS,
@@ -31,7 +30,6 @@ __all__ = [
     "welcome_config",
     "CARL_BOT_ID",
     "DISBOARD_BOT_ID",
-    "BUMP_PING_ROLE_ID",
     "CARL_COOLDOWN",
     "DISBOARD_COOLDOWN",
     "CARL_SUCCESS_KEYWORDS",
