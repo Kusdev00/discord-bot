@@ -328,6 +328,61 @@ class BumpCog(commands.Cog):
 
     # ==================== ADMIN CONFIG COMMANDS ====================
 
+    @bump_config_group.command(name="whoiswaiting", description="List everyone on the bump waitlist")
+    async def bump_config_whoiswaiting(self, interaction: discord.Interaction) -> None:
+        """Show everyone currently on the bump waitlist with their service and
+        time until their personal ping."""
+        waitlist = await get_guild_waitlist(interaction.guild_id)
+
+        embed = discord.Embed(
+            title="🔔 Who's On the Waitlist",
+            color=discord.Color.blue(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        if waitlist:
+            lines = []
+            for e in waitlist:
+                display = "Carl-bot" if e["service"] == "carl" else "Disboard"
+                member = interaction.guild.get_member(e["user_id"])
+                if member:
+                    name = "{}{} {}".format(
+                        member.mention,
+                        "👑" if member.guild_permissions.administrator else "",
+                        member.display_name,
+                    )
+                else:
+                    name = "<@{}> (left guild)".format(e["user_id"])
+
+                now = int(datetime.now(timezone.utc).timestamp())
+                remaining = e["ping_at"] - now
+                if remaining <= 0:
+                    due_str = "**due now**"
+                else:
+                    due_str = "<t:{}:R>".format(int(e["ping_at"]))
+
+                lines.append("{} — {} — {}".format(name, display, due_str))
+
+            description = (
+                "Each person is pinged personally in the notification channel "
+                "when their cooldown expires, then removed from this list.\r\n"
+                "Carl-bot: 6h cooldown - Disboard: 2h cooldown."
+            )
+
+            embed.description = description
+            embed.add_field(
+                name="Waiting ({} entries)".format(len(lines)),
+                value="\r\n".join(lines)[:1024],
+                inline=False,
+            )
+        else:
+            embed.description = (
+                "The waitlist is empty. Bump with Carl-bot or Disboard to get on it."
+            )
+
+        embed.set_footer(text="Guild: {}".format(interaction.guild.name))
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     @bump_config_group.command(name="enabled", description="Enable or disable the bump system")
     @app_commands.describe(state="Enable or disable the bump system")
     @app_commands.choices(state=[
