@@ -1,5 +1,5 @@
 """
-Bump system database layer using SQLite with aiosqlite.
+Bump system database layer - Python 3.9 compatible.
 """
 
 import aiosqlite
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 import sys
 
+# Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -178,7 +179,7 @@ async def get_user_preference(guild_id: int, user_id: int) -> bool:
             (guild_id, user_id),
         ) as cursor:
             row = await cursor.fetchone()
-            return row["notifications_enabled"] if row else True
+            return bool(row["notifications_enabled"]) if row else True
     finally:
         await db.close()
 
@@ -191,7 +192,7 @@ async def set_user_preference(guild_id: int, user_id: int, enabled: bool) -> boo
             """INSERT OR REPLACE INTO bump_users
                (guild_id, user_id, notifications_enabled, settings_updated_at)
                VALUES (?, ?, ?, ?)""",
-            (guild_id, user_id, True if enabled else False, datetime.now(timezone.utc).isoformat()),
+            (guild_id, user_id, 1 if enabled else 0, datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         return True
@@ -207,7 +208,7 @@ async def get_opted_in_users(guild_id: int) -> List[int]:
     db = await get_db()
     try:
         async with db.execute(
-            "SELECT user_id FROM bump_users WHERE guild_id = ? AND notifications_enabled = TRUE",
+            "SELECT user_id FROM bump_users WHERE guild_id = ? AND notifications_enabled = 1",
             (guild_id,),
         ) as cursor:
             rows = await cursor.fetchall()
@@ -240,7 +241,7 @@ async def count_opted_in_users(guild_id: int) -> int:
     db = await get_db()
     try:
         async with db.execute(
-            "SELECT COUNT(*) as count FROM bump_users WHERE guild_id = ? AND notifications_enabled = TRUE",
+            "SELECT COUNT(*) as count FROM bump_users WHERE guild_id = ? AND notifications_enabled = 1",
             (guild_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -272,6 +273,7 @@ async def record_successful_bump(
     message_id: Optional[int] = None,
 ) -> bool:
     """Record a successful bump and update cooldown."""
+    # Import here to avoid circular imports
     from bot.config.bump_config import CARL_COOLDOWN, DISBOARD_COOLDOWN
 
     cooldown = CARL_COOLDOWN if service == "carl" else DISBOARD_COOLDOWN
@@ -307,7 +309,7 @@ async def mark_reminder_sent(guild_id: int, service: str) -> bool:
     db = await get_db()
     try:
         await db.execute(
-            "UPDATE bump_state SET reminder_sent = TRUE, updated_at = ? WHERE guild_id = ? AND service = ?",
+            "UPDATE bump_state SET reminder_sent = 1, updated_at = ? WHERE guild_id = ? AND service = ?",
             (datetime.now(timezone.utc).isoformat(), guild_id, service),
         )
         await db.commit()
@@ -384,7 +386,7 @@ async def trigger_reminder_now(guild_id: int, service: str) -> bool:
     db = await get_db()
     try:
         await db.execute(
-            "UPDATE bump_state SET next_bump_available = ?, reminder_sent = FALSE, updated_at = ? WHERE guild_id = ? AND service = ?",
+            "UPDATE bump_state SET next_bump_available = ?, reminder_sent = 0, updated_at = ? WHERE guild_id = ? AND service = ?",
             (
                 datetime.now(timezone.utc).isoformat(),
                 datetime.now(timezone.utc).isoformat(),

@@ -1,10 +1,10 @@
 """
-Bump notification scheduler and reminder service.
+Bump notification scheduler and reminder service - Python 3.9 compatible.
 """
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import discord
 from bot.database.bump_db import (
     get_all_pending_bumps,
@@ -46,7 +46,7 @@ class BumpScheduler:
 
     def __init__(self, bot):
         self.bot = bot
-        self.task: Optional[asyncio.Task] = None
+        self.task = None  # type: Optional[asyncio.Task]
         self.running = False
 
     async def start(self) -> None:
@@ -143,9 +143,9 @@ class BumpScheduler:
 
             # Build reminder message
             service_name = SERVICE_DISPLAY.get(state["service"], state["service"].capitalize())
-            template = REMINDER_TEMPLATES.get(state["service"], f"🔔 **{state['service'].capitalize()} bump is ready!**\n\nYou can bump the server again using `/bump`.")
+            template = REMINDER_TEMPLATES.get(state["service"], "🔔 **{} bump is ready!**\n\nYou can bump the server again using `/bump`.".format(state['service'].capitalize()))
 
-            message = f"{mention_str}{template}"
+            message = "{}{}".format(mention_str, template)
 
             # Create embed with timestamp
             embed = discord.Embed(
@@ -153,8 +153,8 @@ class BumpScheduler:
                 color=discord.Color.blue(),
                 timestamp=discord.utils.utcnow(),
             )
-            embed.set_author(name=f"🔔 {state['service'].capitalize()} Bump Ready")
-            embed.set_footer(text=f"Guild: {channel.guild.name}")
+            embed.set_author(name="🔔 {} Bump Ready".format(state['service'].capitalize()))
+            embed.set_footer(text="Guild: {}".format(channel.guild.name))
 
             try:
                 await channel.send(content=mention_str if mention_str else None, embed=embed)
@@ -171,13 +171,13 @@ class BumpScheduler:
             logger.exception("Error sending reminder: %s", e)
             return False
 
-    def _chunk_mentions(self, user_ids: list) -> list:
+    def _chunk_mentions(self, user_ids: List[int]) -> List[List[str]]:
         """Split user IDs into chunks for Discord mention limits."""
         chunks = []
         current_chunk = []
 
         for uid in user_ids:
-            mention = f"<@{uid}>"
+            mention = "<@{}>".format(uid)
             current_chunk.append(mention)
 
             if len(current_chunk) >= MAX_MENTIONS_PER_MESSAGE:

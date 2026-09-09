@@ -1,12 +1,12 @@
 """
-Bump system cog with slash commands for user preferences, admin config, and testing.
+Bump notification system cog - Python 3.9 compatible.
 """
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 
 from bot.config import Config
 from bot.config.bump_config import (
@@ -17,7 +17,7 @@ from bot.config.bump_config import (
     SERVICE_CARL,
     SERVICE_DISBOARD,
 )
-from bot.database.bump_db import (
+from bot.database import (
     get_guild_settings,
     update_guild_settings,
     get_user_preference,
@@ -150,10 +150,10 @@ class BumpCog(commands.Cog):
         if status["settings_updated_at"]:
             embed.add_field(
                 name="Last Changed",
-                value=f"<t:{int(datetime.fromisoformat(status['settings_updated_at'].replace('Z', '+00:00')).timestamp())}:R>",
+                value="<t:{}:R>".format(int(datetime.fromisoformat(status['settings_updated_at'].replace('Z', '+00:00')).timestamp())),
                 inline=True,
             )
-        embed.set_footer(text=f"User: {interaction.user}", icon_url=interaction.user.display_avatar.url)
+        embed.set_footer(text="User: {}".format(interaction.user), icon_url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ==================== ADMIN CONFIG COMMANDS ====================
@@ -170,7 +170,7 @@ class BumpCog(commands.Cog):
         await update_guild_settings(interaction.guild_id, enabled=enabled)
 
         await interaction.response.send_message(
-            f"✅ Bump system **{'enabled' if enabled else 'disabled'}** for this server.",
+            "✅ Bump system **{}** for this server.".format("enabled" if enabled else "disabled"),
             ephemeral=True,
         )
 
@@ -182,7 +182,7 @@ class BumpCog(commands.Cog):
         perms = channel.permissions_for(interaction.guild.me)
         if not perms.send_messages or not perms.embed_links:
             await interaction.response.send_message(
-                f"❌ I don't have permission to send messages and embeds in {channel.mention}!",
+                "❌ I don't have permission to send messages and embeds in {}!".format(channel.mention),
                 ephemeral=True,
             )
             return
@@ -190,7 +190,7 @@ class BumpCog(commands.Cog):
         await update_guild_settings(interaction.guild_id, notification_channel_id=channel.id)
 
         await interaction.response.send_message(
-            f"✅ Bump notification channel set to {channel.mention}",
+            "✅ Bump notification channel set to {}".format(channel.mention),
             ephemeral=True,
         )
 
@@ -206,7 +206,7 @@ class BumpCog(commands.Cog):
         await update_guild_settings(interaction.guild_id, mention_opted_in_users=enabled)
 
         await interaction.response.send_message(
-            f"✅ User mentions in bump notifications **{'enabled' if enabled else 'disabled'}**",
+            "✅ User mentions in bump notifications **{}**".format("enabled" if enabled else "disabled"),
             ephemeral=True,
         )
 
@@ -260,27 +260,27 @@ class BumpCog(commands.Cog):
                 if next_available:
                     next_time = datetime.fromisoformat(next_available.replace('Z', '+00:00'))
                     embed.add_field(
-                        name=f"{'Carl-bot' if service == 'carl' else 'Disboard'} Status",
+                        name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
                         value=(
-                            f"Next: <t:{int(next_time.timestamp())}:R>\n"
-                            f"Reminder: {'✅ Sent' if reminder_sent else '⏳ Pending'}"
+                            "Next: <t:{}:R>\n"
+                            "Reminder: {}".format(int(next_time.timestamp()), "✅ Sent" if reminder_sent else "⏳ Pending")
                         ),
                         inline=True,
                     )
                 else:
                     embed.add_field(
-                        name=f"{'Carl-bot' if service == 'carl' else 'Disboard'} Status",
+                        name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
                         value="⏳ No bump recorded yet",
                         inline=True,
                     )
             else:
                 embed.add_field(
-                    name=f"{'Carl-bot' if service == 'carl' else 'Disboard'} Status",
+                    name="{} Status".format("Carl-bot" if service == "carl" else "Disboard"),
                     value="⏳ No bump recorded yet",
                     inline=True,
                 )
 
-        embed.set_footer(text=f"Guild: {interaction.guild.name}", icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+        embed.set_footer(text="Guild: {}".format(interaction.guild.name), icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ==================== ADMIN TEST COMMANDS ====================
@@ -295,9 +295,12 @@ class BumpCog(commands.Cog):
         """Simulate a successful bump for testing."""
         await simulate_bump(interaction.guild_id, service.value)
         await interaction.response.send_message(
-            f"✅ Simulated successful **{service.value.capitalize()}** bump!\n"
-            f"Cooldown set for {6 if service.value == 'carl' else 2} hours.\n"
-            f"Reminder will be sent when cooldown expires.",
+            "✅ Simulated successful **{}** bump!\n"
+            "Cooldown set for {} hours.\n"
+            "Reminder will be sent when cooldown expires.".format(
+                service.value.capitalize(),
+                6 if service.value == "carl" else 2
+            ),
             ephemeral=True,
         )
 
@@ -309,15 +312,16 @@ class BumpCog(commands.Cog):
     ])
     async def bump_test_reminder(self, interaction: discord.Interaction, service: app_commands.Choice[str]) -> None:
         """Send a test reminder immediately without changing cooldown."""
+        from bot.services.bump_notifier import send_test_reminder
         success = await send_test_reminder(self.bot, interaction.guild_id, service.value)
         if success:
             await interaction.response.send_message(
-                f"✅ Test **{service.value.capitalize()}** reminder sent to notification channel!",
+                "✅ Test **{}** reminder sent to notification channel!".format(service.value.capitalize()),
                 ephemeral=True,
             )
         else:
             await interaction.response.send_message(
-                f"❌ Failed to send test reminder. Check notification channel and permissions.",
+                "❌ Failed to send test reminder. Check notification channel and permissions.",
                 ephemeral=True,
             )
 
@@ -350,7 +354,7 @@ class BumpCog(commands.Cog):
             timestamp=discord.utils.utcnow(),
         )
 
-        embed.add_field(name="Author", value=f"{debug_info['author_name']} ({debug_info['author_id']})", inline=True)
+        embed.add_field(name="Author", value="{} ({})".format(debug_info['author_name'], debug_info['author_id']), inline=True)
         embed.add_field(name="Is Carl-bot", value="✅ Yes" if debug_info['is_carl'] else "❌ No", inline=True)
         embed.add_field(name="Is Disboard", value="✅ Yes" if debug_info['is_disboard'] else "❌ No", inline=True)
         embed.add_field(name="Carl Success", value="✅ Yes" if debug_info['carl_success'] else "❌ No", inline=True)
@@ -421,16 +425,16 @@ class BumpCog(commands.Cog):
 
                 if last_bump:
                     last_time = datetime.fromisoformat(last_bump.replace('Z', '+00:00'))
-                    value_lines.append(f"Last: <t:{int(last_time.timestamp())}:R>")
+                    value_lines.append("Last: <t:{}:R>".format(int(last_time.timestamp())))
 
                 if next_available:
                     next_time = datetime.fromisoformat(next_available.replace('Z', '+00:00'))
-                    value_lines.append(f"Next: <t:{int(next_time.timestamp())}:R>")
+                    value_lines.append("Next: <t:{}:R>".format(int(next_time.timestamp())))
 
-                value_lines.append(f"Reminder: {'✅ Sent' if reminder_sent else '⏳ Pending'}")
+                value_lines.append("Reminder: {}".format("✅ Sent" if reminder_sent else "⏳ Pending"))
 
                 embed.add_field(
-                    name=f"{display_name}",
+                    name=display_name,
                     value="\n".join(value_lines),
                     inline=True,
                 )
@@ -447,11 +451,11 @@ class BumpCog(commands.Cog):
         if guild_pending:
             embed.add_field(
                 name="⏳ Pending Reminders",
-                value="\n".join(f"{p['service'].capitalize()}: ready" for p in guild_pending),
+                value="\n".join("{}: ready".format(p['service'].capitalize()) for p in guild_pending),
                 inline=False,
             )
 
-        embed.set_footer(text=f"Guild: {interaction.guild.name}")
+        embed.set_footer(text="Guild: {}".format(interaction.guild.name))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bump_test_group.command(name="reset", description="Reset bump cooldown for testing")
@@ -464,8 +468,8 @@ class BumpCog(commands.Cog):
         """Reset bump state for a service."""
         await reset_bump_state(interaction.guild_id, service.value)
         await interaction.response.send_message(
-            f"⚠️ Reset **{service.value.capitalize()}** bump state for this server.\n"
-            f"Cooldown cleared, next bump available immediately.",
+            "⚠️ Reset **{}** bump state for this server.\n"
+            "Cooldown cleared, next bump available immediately.".format(service.value.capitalize()),
             ephemeral=True,
         )
 
