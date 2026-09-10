@@ -158,6 +158,23 @@ class BumpCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         """Listen for successful bumps from Carl-bot and Disboard."""
+        # Tracer: log EVERY message from either bump bot, before any gate.
+        # Volume is tiny (a few per day) and it proves whether the gateway
+        # actually delivered the event to us - no log here means the event
+        # never arrived, not that detection failed.
+        if message.author.id in (CARL_BOT_ID, DISBOARD_BOT_ID) or message.application_id in (
+            CARL_BOT_ID,
+            DISBOARD_BOT_ID,
+        ):
+            logger.info(
+                "Bump TRACE: msg from author %d app %s in channel %d (guild=%s) content=%r",
+                message.author.id,
+                message.application_id,
+                message.channel.id if message.channel else -1,
+                message.guild.id if message.guild else None,
+                (message.content or "")[:80],
+            )
+
         if not message.guild:
             return
 
