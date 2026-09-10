@@ -90,6 +90,7 @@ def make_message(
     else:
         msg.interaction_metadata = None
     msg.interaction = None
+    msg.created_at = datetime.now(timezone.utc)
     msg.reference = (
         SimpleNamespace(message_id=reference_message_id, resolved=None) if reference_message_id else None
     )

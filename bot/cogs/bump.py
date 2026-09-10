@@ -2,6 +2,7 @@
 Bump notification system cog - Python 3.9 compatible.
 """
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
@@ -66,16 +67,23 @@ class BumpCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.scheduler: Optional[BumpScheduler] = None
+        self._backfill_task: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         """Initialize database and start scheduler when cog loads."""
         await init_db()
         self.scheduler = BumpScheduler(self.bot)
         await self.scheduler.start()
+        # Discord does not replay messages missed while we were down, so a
+        # bump confirmed during a restart would be lost forever. Re-scan the
+        # notification channel once we're connected.
+        self._backfill_task = asyncio.create_task(self._backfill_recent_bumps())
         logger.info("Bump system database initialized and scheduler started")
 
     async def cog_unload(self) -> None:
         """Stop scheduler when cog unloads."""
+        if self._backfill_task:
+            self._backfill_task.cancel()
         if self.scheduler:
             await self.scheduler.stop()
         logger.info("Bump scheduler stopped")
@@ -200,7 +208,27 @@ class BumpCog(commands.Cog):
                 logger.debug("Duplicate bump message ignored: %d", message.id)
                 return
 
-            bump_time = datetime.now(timezone.utc)
+            # Skip confirmations at or before the last recorded bump for this
+            # service: they were already counted (backfill re-visits old
+            # messages, and re-adding them would resurrect stale cooldowns).
+            state = await get_bump_state(message.guild.id, service)
+            if state and state.get("last_successful_bump"):
+                try:
+                    last_ts = int(state["last_successful_bump"])
+                except (TypeError, ValueError):
+                    last_ts = None
+                if last_ts and int(message.created_at.timestamp()) <= last_ts:
+                    logger.info(
+                        "Ignored %s bump confirmation %d (at or before last recorded bump)",
+                        service,
+                        message.id,
+                    )
+                    return
+
+            # The bump happened when the confirmation was posted - not "now".
+            # Equal for live messages; correct for backfilled ones after a
+            # restart, so cooldowns are dated from the real bump time.
+            bump_time = message.created_at or datetime.now(timezone.utc)
 
             # Disboard's cooldown is SERVER-WIDE: only one bump per 2 hours.
             # Discord mirrors its confirmation across channels, so a second copy
@@ -304,6 +332,48 @@ class BumpCog(commands.Cog):
                     " ".join(combined.split())[:200],
                 )
 
+
+    async def _backfill_recent_bumps(self) -> None:
+        """Re-scan recent bump-bot messages after startup and reprocess them.
+
+        Covers the restart blind spot: bump confirmations posted while the bot
+        was down never generate MESSAGE_CREATE events. on_message is safe to
+        call again on the same messages - the duplicate-message-id check and
+        the Disboard cooldown guard prevent double-counting.
+        """
+        try:
+            await self.bot.wait_until_ready()
+            for guild in list(self.bot.guilds):
+                try:
+                    if not await is_guild_enabled(guild.id):
+                        continue
+                    settings = await get_guild_settings(guild.id)
+                    channel_id = settings.get("notification_channel_id")
+                    channel = guild.get_channel(channel_id) if channel_id else None
+                    if channel is None or not hasattr(channel, "history"):
+                        continue
+
+                    processed = 0
+                    async for msg in channel.history(limit=100):
+                        if msg.author.id in (CARL_BOT_ID, DISBOARD_BOT_ID) or msg.application_id in (
+                            CARL_BOT_ID,
+                            DISBOARD_BOT_ID,
+                        ):
+                            await self.on_message(msg)
+                            processed += 1
+                    if processed:
+                        logger.info(
+                            "Bump backfill: reprocessed %d bump-bot message(s) in guild %d (#%s)",
+                            processed,
+                            guild.id,
+                            channel.id,
+                        )
+                except Exception:
+                    logger.exception("Bump backfill failed for guild %s", guild.id)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Bump backfill crashed")
 
     async def _resolve_bumper_from_reference(self, message: discord.Message) -> Optional[Union[discord.Member, discord.User]]:
         """Fetch the referenced message fresh and read the invoking user out of it."""
