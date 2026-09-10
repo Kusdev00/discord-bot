@@ -22,6 +22,10 @@ from bot.database.bump_db import (
     remove_from_waitlist,
     get_guild_waitlist,
     clear_guild_waitlist,
+    add_pending_bumper,
+    get_pending_bumpers,
+    resolve_pending_bumper,
+    drop_pending_bumper,
 )
 
 __all__ = [
@@ -44,4 +48,8 @@ __all__ = [
     "remove_from_waitlist",
     "get_guild_waitlist",
     "clear_guild_waitlist",
+    "add_pending_bumper",
+    "get_pending_bumpers",
+    "resolve_pending_bumper",
+    "drop_pending_bumper",
 ]

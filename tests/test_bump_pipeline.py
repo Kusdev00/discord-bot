@@ -221,6 +221,12 @@ async def test_db_flow():
     carl_row = next(r for r in rows if r["service"] == "carl")
     check("re-bump extends carl ping_at", abs(carl_row["ping_at"] - int((now + timedelta(hours=12)).timestamp())) < 5)
 
+    # A late-attributed OLDER confirmation must never shorten a cooldown.
+    await bump_db.add_to_waitlist(guild, user, "carl", int((now + timedelta(hours=1)).timestamp()))
+    rows = await bump_db.get_guild_waitlist(guild)
+    carl_row = next(r for r in rows if r["service"] == "carl")
+    check("older confirmation can't shorten cooldown", abs(carl_row["ping_at"] - int((now + timedelta(hours=12)).timestamp())) < 5)
+
     # Simulate restart: the DB file is on disk; entries must still be there.
     rows = await bump_db.get_guild_waitlist(guild)
     check("entries persist (restart survival)", len(rows) == 2)
@@ -229,9 +235,15 @@ async def test_db_flow():
     due = await bump_db.get_due_waitlist()
     check("nothing due yet", len(due) == 0, f"got {len(due)}")
 
-    # Make entries due and run the scheduler with a mock channel.
-    await bump_db.add_to_waitlist(guild, user, "carl", int((now - timedelta(seconds=1)).timestamp()))
-    await bump_db.add_to_waitlist(guild, user, "disboard", int((now - timedelta(seconds=1)).timestamp()))
+    # Make entries due by rewinding the recorded ping times directly
+    # (add_to_waitlist only ever extends a cooldown, by design).
+    db = await bump_db.get_db()
+    await db.execute(
+        "UPDATE bump_waitlist SET ping_at = ? WHERE guild_id = ?",
+        (int((now - timedelta(seconds=1)).timestamp()), guild),
+    )
+    await db.commit()
+    await db.close()
 
     # The scheduler only delivers to the CONFIGURED notification channel.
     await bump_db.update_guild_settings(guild, notification_channel_id=channel_id)
@@ -494,6 +506,146 @@ async def test_restart_persistence():
     check("no duplicate after restart", len(sent) == 1)
 
 
+async def test_identity_retry():
+    """A bump whose bumper can't be identified is queued and later repaired.
+
+    Mirrors the live bug: the cached confirmation carries no interaction
+    metadata, so nobody lands on the waitlist even though the bump counted.
+    A fresh fetch (as the retry loop does) finds the invoking user.
+    """
+    print("\n[8] Identity retry for unidentified bumpers")
+    await bump_db.init_db()
+    guild = 555555555555555555
+    user = 123456789012345678
+    channel_id = 123456789012345678
+
+    cog = BumpCog(MagicMock())
+    cog.bot.get_user = lambda uid: SimpleNamespace(id=uid)
+
+    async def ok(guild_id):
+        return True
+
+    with patch("bot.cogs.bump.is_guild_enabled", ok):
+        # Confirmation with NO identifiable bumper anywhere.
+        orphan = make_message(
+            author_id=CARL_BOT_ID,
+            content="You've successfully bumped this server, it is now ranked 530 out of 24120 servers!",
+            application_id=CARL_BOT_ID,
+            guild_id=guild,
+        )
+        orphan.id = 888000000000000001
+        await cog.on_message(orphan)
+
+        rows = await bump_db.get_guild_waitlist(guild)
+        check("unidentified bump adds nobody to waitlist", len(rows) == 0, str(rows))
+
+        pending = await bump_db.get_pending_bumpers()
+        check("unidentified bump queued for retry", len(pending) == 1, str(pending))
+        if pending:
+            check("queued row keeps service + ping time", pending[0]["service"] == "carl" and pending[0]["ping_at"] > 0)
+
+        # The queue is idempotent (backfill can't double-queue).
+        await bump_db.add_pending_bumper(guild, orphan.id, "carl", 123)
+        pending = await bump_db.get_pending_bumpers()
+        check("re-queueing same message is a no-op", len(pending) == 1, str(len(pending)))
+
+        # Retry pass: fresh fetch now carries the interaction user, exactly
+        # like the live diagnostic command that proved it for orange's bump.
+        def fetch_message(msg_id):
+            repaired = make_message(
+                author_id=CARL_BOT_ID,
+                content="You've successfully bumped this server, it is now ranked 530 out of 24120 servers!",
+                application_id=CARL_BOT_ID,
+                interaction_user_id=user,
+                guild_id=guild,
+            )
+            repaired.id = msg_id
+            return repaired
+
+        async def fetch_message_async(msg_id):
+            return fetch_message(msg_id)
+
+        channel = MagicMock()
+        channel.id = channel_id
+        channel.fetch_message = fetch_message_async
+        cog.bot.get_channel = lambda cid: channel if cid == channel_id else None
+        cog.bot.get_guild = lambda gid: None
+
+        await cog._repair_pending_bumpers()
+
+        rows = await bump_db.get_guild_waitlist(guild)
+        check("retry resolved the bumper onto the waitlist", len(rows) == 1, str(rows))
+        if rows:
+            check("repaired row is for the right user + service", rows[0]["user_id"] == user and rows[0]["service"] == "carl")
+        check("queue empty after resolution", len(await bump_db.get_pending_bumpers()) == 0)
+
+        # Retry pass again: no duplicate waitlist rows.
+        await cog._repair_pending_bumpers()
+        check("no duplicate after second pass", len(await bump_db.get_guild_waitlist(guild)) == 1)
+
+
+async def test_restart_bumper_repair():
+    """Restart scenario: the last confirmation before a restart can't be
+    reprocessed (duplicate message id) and its bumper is missing from the
+    waitlist. Backfill must repair it WITHOUT resurrecting pings that were
+    already delivered before the restart.
+    """
+    print("\n[9] Restart: missed bumper repaired, delivered ping not resurrected")
+    await bump_db.init_db()
+    guild = 666666666666666666
+    user = 123456789012345678
+    now = datetime.now(timezone.utc)
+
+    cog = BumpCog(MagicMock())
+
+    # Confirmation from 1h ago (4h left on the 6h Carl cooldown) whose bumper
+    # was never recorded because the bot restarted right after recording it.
+    msg = make_message(
+        author_id=CARL_BOT_ID,
+        content="You've successfully bumped this server, it is now ranked 531 out of 24120 servers!",
+        application_id=CARL_BOT_ID,
+        interaction_user_id=user,
+        guild_id=guild,
+    )
+    msg.created_at = now - timedelta(hours=1)
+    msg.id = 999000000000000001
+
+    # Backfill calls on_message; make the guild enabled.
+    with patch("bot.cogs.bump.is_guild_enabled", lambda gid: asyncio.sleep(0, True)):
+        # The message was already counted before the restart -> on_message
+        # must skip it (at/before last recorded bump). Pre-seed that state.
+        await bump_db.record_successful_bump(guild, "carl", msg.created_at)
+        await bump_db.mark_bump_message_seen(guild, "carl", msg.id)
+
+        repaired = await cog._repair_backfill_message(msg)
+        check("backfill repaired the missed bumper", repaired is True)
+
+        rows = await bump_db.get_guild_waitlist(guild)
+        check("repaired waitlist row has correct cooldown", len(rows) == 1 and abs(rows[0]["ping_at"] - int((msg.created_at + timedelta(hours=6)).timestamp())) < 5, str(rows))
+
+        # Second backfill of the same message must not duplicate the row.
+        repaired_again = await cog._repair_backfill_message(msg)
+        check("second backfill pass adds no duplicate", repaired_again is False)
+        check("waitlist still has exactly one row", len(await bump_db.get_guild_waitlist(guild)) == 1)
+
+        # An ALREADY-DELIVERED window (confirmation 7h old) must never be
+        # resurrected.
+        old_msg = make_message(
+            author_id=CARL_BOT_ID,
+            content="You've successfully bumped this server, it is now ranked 532 out of 24120 servers!",
+            application_id=CARL_BOT_ID,
+            interaction_user_id=user,
+            guild_id=guild,
+        )
+        old_msg.created_at = now - timedelta(hours=7)
+        old_msg.id = 999000000000000002
+        await bump_db.record_successful_bump(guild, "carl", old_msg.created_at)
+        await bump_db.mark_bump_message_seen(guild, "carl", old_msg.id)
+        repaired_old = await cog._repair_backfill_message(old_msg)
+        check("delivered window not resurrected", repaired_old is False)
+        check("waitlist unchanged by stale confirmation", len(await bump_db.get_guild_waitlist(guild)) == 1)
+
+
 def test_debug_dump():
     print("\n[5] Debug diagnostics")
     msg = make_message(
@@ -521,6 +673,8 @@ async def main():
     test_debug_dump()
     await test_on_message_pipeline()
     await test_restart_persistence()
+    await test_identity_retry()
+    await test_restart_bumper_repair()
 
     print(f"\n{'=' * 50}")
     print(f"TOTAL: {PASS} passed, {FAIL} failed")

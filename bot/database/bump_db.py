@@ -58,6 +58,21 @@ async def init_db() -> None:
             )
         """)
 
+        # Bump confirmations whose bumper could not be identified when the
+        # message was processed (the cached interaction metadata is sometimes
+        # empty). The repair loop re-fetches these messages - fresh fetches
+        # reliably carry the invoking user - and moves them onto the waitlist.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bump_bumpers (
+                message_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER,
+                service TEXT NOT NULL,
+                ping_at INTEGER NOT NULL,
+                created_at INTEGER
+            )
+        """)
+
         # Bump state per guild per service (timestamps stored as unix epoch seconds)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bump_state (
@@ -316,8 +331,9 @@ async def check_duplicate_bump(guild_id: int, service: str, message_id: int) -> 
 async def add_to_waitlist(guild_id: int, user_id: int, service: str, ping_at: int) -> bool:
     """Add a bumper to the per-person waitlist.
 
-    If the user is already queued for this service (e.g. two bump bot mirrors
-    of the same bump), the newest cooldown wins.
+    If the user is already queued for this service, the LATER ping time wins:
+    a re-bump extends the reminder, and a late-attributed older confirmation
+    can never shorten an existing cooldown.
     """
     db = await get_db()
     try:
@@ -325,7 +341,11 @@ async def add_to_waitlist(guild_id: int, user_id: int, service: str, ping_at: in
             """INSERT INTO bump_waitlist (guild_id, user_id, service, ping_at, created_at)
                VALUES (?, ?, ?, ?, ?)
                ON CONFLICT (guild_id, user_id, service)
-               DO UPDATE SET ping_at = excluded.ping_at, claim_expires_at = NULL, created_at = excluded.created_at""",
+               DO UPDATE SET ping_at = MAX(ping_at, excluded.ping_at),
+                            claim_expires_at = CASE
+                                WHEN ping_at <> excluded.ping_at THEN NULL
+                                ELSE claim_expires_at END,
+                            created_at = excluded.created_at""",
             (guild_id, user_id, service, int(ping_at), int(datetime.now(timezone.utc).timestamp())),
         )
         await db.commit()
@@ -436,5 +456,94 @@ async def clear_guild_waitlist(guild_id: int) -> int:
     except Exception as e:
         logger.exception("Failed to clear waitlist for guild %d: %s", guild_id, e)
         return 0
+    finally:
+        await db.close()
+
+
+# ==================== Pending bumpers (identity retry queue) ====================
+
+async def add_pending_bumper(
+    guild_id: int,
+    message_id: int,
+    service: str,
+    ping_at: int,
+    channel_id: Optional[int] = None,
+) -> bool:
+    """Queue a bump confirmation whose bumper couldn't be identified yet.
+
+    The message id is the primary key and re-queueing is a no-op, so startup
+    backfills can't reset the retry clock of an existing entry.
+    """
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO bump_bumpers (message_id, guild_id, channel_id, service, ping_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (message_id) DO NOTHING""",
+            (
+                message_id,
+                guild_id,
+                channel_id,
+                service,
+                int(ping_at),
+                int(datetime.now(timezone.utc).timestamp()),
+            ),
+        )
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to queue pending bumper for message %d: %s", message_id, e)
+        return False
+    finally:
+        await db.close()
+
+
+async def get_pending_bumpers() -> List[Dict[str, Any]]:
+    """All pending-bumper rows, oldest first."""
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT * FROM bump_bumpers ORDER BY created_at ASC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
+
+async def resolve_pending_bumper(message_id: int) -> Optional[Dict[str, Any]]:
+    """Pop a pending-bumper row once its identity was resolved.
+
+    Returns the row (guild/service/ping_at for the waitlist insert) or None if
+    it was already resolved by another pass.
+    """
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT * FROM bump_bumpers WHERE message_id = ?", (message_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        await db.execute("DELETE FROM bump_bumpers WHERE message_id = ?", (message_id,))
+        await db.commit()
+        return dict(row)
+    except Exception as e:
+        logger.exception("Failed to resolve pending bumper for message %d: %s", message_id, e)
+        return None
+    finally:
+        await db.close()
+
+
+async def drop_pending_bumper(message_id: int) -> bool:
+    """Give up on a pending-bumper row (expired without a resolvable identity)."""
+    db = await get_db()
+    try:
+        await db.execute("DELETE FROM bump_bumpers WHERE message_id = ?", (message_id,))
+        await db.commit()
+        return True
+    except Exception as e:
+        logger.exception("Failed to drop pending bumper for message %d: %s", message_id, e)
+        return False
     finally:
         await db.close()

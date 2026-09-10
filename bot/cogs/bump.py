@@ -12,6 +12,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot.config.bump_config import (
+    BUMP_IDENTITY_RETRY_DELAY,
+    BUMP_IDENTITY_RETRY_LIMIT,
     CARL_BOT_ID,
     CARL_COOLDOWN,
     DISBOARD_BOT_ID,
@@ -31,6 +33,10 @@ from bot.database import (
     record_successful_bump,
     reset_bump_state,
     update_guild_settings,
+    add_pending_bumper,
+    drop_pending_bumper,
+    get_pending_bumpers,
+    resolve_pending_bumper,
 )
 from bot.logging_config import get_logger
 from bot.services.bump_detector import debug_bump_detection, detect_bump
@@ -68,6 +74,7 @@ class BumpCog(commands.Cog):
         self.bot = bot
         self.scheduler: Optional[BumpScheduler] = None
         self._backfill_task: Optional[asyncio.Task] = None
+        self._identity_retry_task: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         """Initialize database and start scheduler when cog loads."""
@@ -78,12 +85,17 @@ class BumpCog(commands.Cog):
         # bump confirmed during a restart would be lost forever. Re-scan the
         # notification channel once we're connected.
         self._backfill_task = asyncio.create_task(self._backfill_recent_bumps())
+        # Bump confirmations whose bumper couldn't be identified from the
+        # cached interaction metadata are retried on a loop until they expire.
+        self._identity_retry_task = asyncio.create_task(self._identity_retry_loop())
         logger.info("Bump system database initialized and scheduler started")
 
     async def cog_unload(self) -> None:
         """Stop scheduler when cog unloads."""
         if self._backfill_task:
             self._backfill_task.cancel()
+        if self._identity_retry_task:
+            self._identity_retry_task.cancel()
         if self.scheduler:
             await self.scheduler.stop()
         logger.info("Bump scheduler stopped")
@@ -258,9 +270,12 @@ class BumpCog(commands.Cog):
 
             # Put the bumper on the personal waitlist: they get pinged in the
             # notification channel when THEIR cooldown (2h/6h) expires, then
-            # removed from the list.
+            # removed from the list. Live confirmations always have an active
+            # window; backfilled old ones may not - adding those would ping
+            # days late, so only the state is recorded for them.
             cooldown = CARL_COOLDOWN if service == "carl" else DISBOARD_COOLDOWN
             ping_at = int((bump_time + cooldown).timestamp())
+            window_active = ping_at > int(datetime.now(timezone.utc).timestamp())
 
             if Config.DEBUG:
                 try:
@@ -276,6 +291,16 @@ class BumpCog(commands.Cog):
                     )
                 except Exception:
                     logger.exception("Bump DEBUG dump failed")
+
+            if not window_active:
+                logger.info(
+                    "Recorded %s bump in guild %d from %s but its cooldown window "
+                    "already passed; not adding anyone to the waitlist",
+                    service,
+                    message.guild.id,
+                    message.id,
+                )
+                return
 
             bumper = self._find_bumper(message)
             pathway = "cached reference"
@@ -297,9 +322,20 @@ class BumpCog(commands.Cog):
                         bool(getattr(message, "interaction", None)),
                         bool(message.reference),
                     )
+                # The bump itself is recorded; only the identity is missing.
+                # Queue the confirmation for the identity-retry loop, which
+                # re-fetches the message until Discord serves the interaction
+                # metadata or the retry window expires.
+                await add_pending_bumper(
+                    message.guild.id,
+                    message.id,
+                    service,
+                    ping_at,
+                    channel_id=message.channel.id,
+                )
                 logger.info(
                     "Recorded %s bump in guild %d but could not identify the bumper "
-                    "(pathway=%s); nobody added to the waitlist",
+                    "(pathway=%s); queued for identity retry",
                     service,
                     message.guild.id,
                     pathway,
@@ -333,6 +369,182 @@ class BumpCog(commands.Cog):
                 )
 
 
+    async def _identity_retry_loop(self) -> None:
+        """Retry bumper identification for queued bump confirmations.
+
+        Interaction metadata is sometimes missing from the cached message
+        (and from the cached reply target), yet a FRESH fetch of the same
+        message reliably carries it - the diagnostic command proves this
+        regularly. Queued messages are re-fetched every pass until the
+        identity resolves or the retry window expires.
+        """
+        try:
+            await self.bot.wait_until_ready()
+            while True:
+                try:
+                    await self._repair_pending_bumpers()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Bumper identity retry pass failed")
+                await asyncio.sleep(BUMP_IDENTITY_RETRY_DELAY)
+        except asyncio.CancelledError:
+            pass
+
+    async def _repair_pending_bumpers(self) -> None:
+        """Resolve queued confirmations and move them onto the waitlist."""
+        pending = await get_pending_bumpers()
+        if not pending:
+            return
+
+        now = int(datetime.now(timezone.utc).timestamp())
+        for row in pending:
+            created = int(row.get("created_at") or 0)
+            window_expired = created and now - created > BUMP_IDENTITY_RETRY_LIMIT
+            if window_expired:
+                await drop_pending_bumper(row["message_id"])
+                logger.warning(
+                    "Gave up identifying the bumper for %s confirmation %d in guild %d "
+                    "after %d days; nobody added to the waitlist",
+                    row["service"],
+                    row["message_id"],
+                    row["guild_id"],
+                    BUMP_IDENTITY_RETRY_LIMIT // 86400,
+                )
+                continue
+
+            message = await self._fetch_message_anywhere(
+                row["message_id"], row.get("channel_id"), row.get("guild_id")
+            )
+            if message is None:
+                continue
+
+            bumper = self._find_bumper(message)
+            if bumper is None:
+                bumper = await self._resolve_bumper_from_reference(message)
+
+            if bumper is None:
+                continue
+
+            entry = await resolve_pending_bumper(row["message_id"])
+            if entry is None:
+                continue
+
+            # Guard against stale reminders: if a bump for this service was
+            # recorded at/after this confirmation's cooldown expiry, this
+            # cooldown cycle has already been superseded - its reminder was
+            # either delivered (as a newer bump's ping) or deliberately reset.
+            # A late row must never resurrect a ping that already happened.
+            state = await get_bump_state(entry["guild_id"], entry["service"])
+            last = int(state["last_successful_bump"]) if state and state.get("last_successful_bump") else None
+            if last is not None and last >= int(entry["ping_at"]):
+                logger.info(
+                    "Dropping late-identified bumper for %s confirmation %d: cooldown "
+                    "window (ping at %d) already superseded by bump at %d",
+                    entry["service"],
+                    row["message_id"],
+                    int(entry["ping_at"]),
+                    last,
+                )
+                continue
+
+            await add_to_waitlist(entry["guild_id"], bumper.id, entry["service"], entry["ping_at"])
+            logger.info(
+                "Late-identified bumper %s (%d) for %s confirmation %d in guild %d; "
+                "ping due at %d",
+                bumper,
+                bumper.id,
+                entry["service"],
+                row["message_id"],
+                entry["guild_id"],
+                entry["ping_at"],
+            )
+
+    async def _fetch_message_anywhere(
+        self,
+        message_id: int,
+        channel_id: Optional[int],
+        guild_id: Optional[int] = None,
+    ) -> Optional[discord.Message]:
+        """Fetch a message by id: from the recorded channel first, then from
+        the rest of the guild's channels (covers a changed/deleted channel
+        record). Returns None if no fetch succeeds."""
+        channels = []
+        if channel_id is not None:
+            channel = self.bot.get_channel(channel_id)
+            if channel is not None and hasattr(channel, "fetch_message"):
+                channels.append(channel)
+
+        if guild_id is not None:
+            guild = self.bot.get_guild(guild_id)
+            if guild is not None:
+                for channel in guild.channels:
+                    if hasattr(channel, "fetch_message") and all(c.id != channel.id for c in channels):
+                        channels.append(channel)
+
+        for channel in channels:
+            try:
+                return await channel.fetch_message(message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        return None
+
+    async def _repair_backfill_message(self, msg: discord.Message) -> bool:
+        """Repair one backfilled confirmation whose bumper missed the waitlist.
+
+        on_message can process a confirmation without adding its bumper: the
+        duplicate/at-or-before guards skip restart duplicates, and the cached
+        identity may be missing (queued for retry instead). A fresh fetch
+        usually carries the interaction metadata, so the row can be backfilled.
+
+        Returns True if a bumper was added. Only still-active cooldown windows
+        are repaired: an expired ping_at was either delivered already or would
+        be pointless noise. The add is an upsert, so a retry-loop resolution of
+        the same confirmation can never produce a second row or a double ping.
+        """
+        if not msg.guild:
+            return False
+
+        service = "carl" if CARL_BOT_ID in (msg.author.id, msg.application_id) else "disboard"
+        cooldown = CARL_COOLDOWN if service == "carl" else DISBOARD_COOLDOWN
+        ping_at = int((msg.created_at + cooldown).timestamp())
+        now = int(datetime.now(timezone.utc).timestamp())
+        if ping_at <= now:
+            # Expired window: let on_message record the state/mark-seen part;
+            # it will not add an expired window to the waitlist.
+            await self.on_message(msg)
+            return False
+
+        bumper = self._find_bumper(msg)
+        if bumper is None and msg.reference and msg.reference.message_id:
+            bumper = await self._resolve_bumper_from_reference(msg)
+        if bumper is None:
+            # Still unidentifiable: on_message (called below) queues it for the
+            # identity-retry loop if it wasn't already.
+            await self.on_message(msg)
+            return False
+
+        # Is this confirmation's window already covered on the waitlist?
+        rows = await get_guild_waitlist(msg.guild.id)
+        if any(r["service"] == service and int(r["ping_at"]) == ping_at for r in rows):
+            await self.on_message(msg)  # keep dedupe/state handling intact
+            return False
+
+        await self.on_message(msg)  # record state / mark seen if applicable
+        await add_to_waitlist(msg.guild.id, bumper.id, service, ping_at)
+        # If a previous pass queued this confirmation for identity retry,
+        # it is resolved now - drop the queue entry (no-op if absent).
+        await drop_pending_bumper(msg.id)
+        logger.info(
+            "Bump backfill repair: added %s (%d) to the waitlist from "
+            "confirmation %d in guild %d",
+            bumper,
+            bumper.id,
+            msg.id,
+            msg.guild.id,
+        )
+        return True
+
     async def _backfill_recent_bumps(self) -> None:
         """Re-scan recent bump-bot messages after startup and reprocess them.
 
@@ -354,19 +566,22 @@ class BumpCog(commands.Cog):
                         continue
 
                     processed = 0
+                    repaired = 0
                     async for msg in channel.history(limit=100):
                         if msg.author.id in (CARL_BOT_ID, DISBOARD_BOT_ID) or msg.application_id in (
                             CARL_BOT_ID,
                             DISBOARD_BOT_ID,
                         ):
-                            await self.on_message(msg)
+                            if await self._repair_backfill_message(msg):
+                                repaired += 1
                             processed += 1
                     if processed:
                         logger.info(
-                            "Bump backfill: reprocessed %d bump-bot message(s) in guild %d (#%s)",
+                            "Bump backfill: reprocessed %d bump-bot message(s) in guild %d (#%s), %d repaired",
                             processed,
                             guild.id,
                             channel.id,
+                            repaired,
                         )
                 except Exception:
                     logger.exception("Bump backfill failed for guild %s", guild.id)
