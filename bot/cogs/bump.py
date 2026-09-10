@@ -2,38 +2,39 @@
 Bump notification system cog - Python 3.9 compatible.
 """
 
-import discord
 import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Union
+
+import discord
 from discord import app_commands
 from discord.ext import commands
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Union
 
 from bot.config.bump_config import (
     CARL_BOT_ID,
-    DISBOARD_BOT_ID,
     CARL_COOLDOWN,
+    DISBOARD_BOT_ID,
     DISBOARD_COOLDOWN,
 )
 from bot.database import (
-    get_guild_settings,
-    update_guild_settings,
-    is_guild_enabled,
-    get_bump_state,
-    record_successful_bump,
-    mark_bump_message_seen,
-    check_duplicate_bump,
-    reset_bump_state,
-    get_all_guild_bump_states,
-    simulate_bump,
     add_to_waitlist,
-    get_guild_waitlist,
+    check_duplicate_bump,
     clear_guild_waitlist,
+    get_all_guild_bump_states,
+    get_bump_state,
+    get_guild_settings,
+    get_guild_waitlist,
     init_db,
+    is_guild_enabled,
+    mark_bump_message_seen,
+    record_successful_bump,
+    reset_bump_state,
+    update_guild_settings,
 )
-from bot.services.bump_detector import detect_bump, debug_bump_detection
-from bot.services.bump_notifier import BumpScheduler
 from bot.logging_config import get_logger
+from bot.services.bump_detector import debug_bump_detection, detect_bump
+from bot.services.bump_notifier import BumpScheduler
+from config import Config
 
 logger = get_logger(__name__)
 
@@ -88,6 +89,11 @@ class BumpCog(commands.Cog):
             user = getattr(message.interaction_metadata, "user", None)
             if user:
                 return user
+
+        # 1b. APP messages: message.interaction is deprecated/absent for newer
+        # interaction responses; application_id may carry the application (not
+        # the user). Nothing more to extract from those here - logged for
+        # diagnosis in on_message instead.
 
         # 2. Check interaction attribute
         if hasattr(message, "interaction") and message.interaction:
@@ -155,8 +161,14 @@ class BumpCog(commands.Cog):
         if not message.guild:
             return
 
-        # Only process messages from Carl-bot or Disboard
-        if message.author.id not in (CARL_BOT_ID, DISBOARD_BOT_ID):
+        # Only process messages from Carl-bot or Disboard. APP messages
+        # (slash-command interaction responses) are attributed via
+        # message.application_id, which is checked too in case the author
+        # object was hydrated as something other than the bot user.
+        if message.author.id not in (CARL_BOT_ID, DISBOARD_BOT_ID) and message.application_id not in (
+            CARL_BOT_ID,
+            DISBOARD_BOT_ID,
+        ):
             return
 
         # Check if bump system is enabled for this guild
@@ -203,8 +215,22 @@ class BumpCog(commands.Cog):
             # notification channel when THEIR cooldown (2h/6h) expires, then
             # removed from the list.
             cooldown = CARL_COOLDOWN if service == "carl" else DISBOARD_COOLDOWN
-            service_display = "Carl-bot" if service == "carl" else "Disboard"
             ping_at = int((bump_time + cooldown).timestamp())
+
+            if Config.DEBUG:
+                try:
+                    logger.info(
+                        "Bump DEBUG author_id=%d application_id=%s webhook_id=%s type=%s channel=%d content=%r embeds=%d",
+                        message.author.id,
+                        message.application_id,
+                        message.webhook_id,
+                        message.type,
+                        message.channel.id,
+                        (message.content or "")[:120],
+                        len(message.embeds),
+                    )
+                except Exception:
+                    logger.exception("Bump DEBUG dump failed")
 
             bumper = self._find_bumper(message)
             pathway = "cached reference"
@@ -217,6 +243,15 @@ class BumpCog(commands.Cog):
                 pathway = "fresh reference fetch"
 
             if bumper is None:
+                if Config.DEBUG:
+                    logger.info(
+                        "Bump DEBUG bumper-identify failed: app_id=%s webhook_id=%s meta=%s interaction=%s ref=%s",
+                        message.application_id,
+                        message.webhook_id,
+                        bool(getattr(message, "interaction_metadata", None)),
+                        bool(getattr(message, "interaction", None)),
+                        bool(message.reference),
+                    )
                 logger.info(
                     "Recorded %s bump in guild %d but could not identify the bumper "
                     "(pathway=%s); nobody added to the waitlist",
@@ -476,6 +511,124 @@ class BumpCog(commands.Cog):
                 "❌ Failed to send sample ping. Check the notification channel and my permissions.",
                 ephemeral=True,
             )
+
+    @bump_test_group.command(name="debugme", description="Show raw fields of a bump-bot message (diagnostics)")
+    @app_commands.describe(message_id="Message ID to inspect (optional, analyzes last Carl/Disboard message)")
+    async def bump_test_debugme(self, interaction: discord.Interaction, message_id: Optional[str] = None) -> None:
+        """Dump the raw fields that decide bump detection for a real message.
+
+        Temporary diagnostics for the Carl-bot detection bug: shows author ID,
+        application ID, webhook ID, message type, content, embeds, and the
+        invoking interaction user so we can see exactly what Discord sends.
+        """
+        if message_id:
+            try:
+                msg_id = int(message_id)
+                message = await interaction.channel.fetch_message(msg_id)
+            except (ValueError, discord.NotFound):
+                await interaction.response.send_message("❌ Invalid message ID or message not found.", ephemeral=True)
+                return
+        else:
+            from bot.config.bump_config import CARL_BOT_ID as _CARL
+            from bot.config.bump_config import DISBOARD_BOT_ID as _DIS
+            async for msg in interaction.channel.history(limit=20):
+                if msg.author.id in (_CARL, _DIS):
+                    message = msg
+                    break
+            else:
+                await interaction.response.send_message("❌ No recent Carl-bot or Disboard message found.", ephemeral=True)
+                return
+
+        info = debug_bump_detection(message)
+
+        embed = discord.Embed(
+            title="🔬 Bump Message Diagnostics",
+            color=discord.Color.dark_teal(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        embed.add_field(
+            name="Author",
+            value="{}\nID: `{}` (bot={})".format(info["author_name"], info["author_id"], info["author_bot"]),
+            inline=True,
+        )
+        embed.add_field(
+            name="Application ID",
+            value="`{}`".format(info["application_id"]) if info["application_id"] else "`None`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Webhook ID",
+            value="`{}`".format(info["webhook_id"]) if info["webhook_id"] else "`None`",
+            inline=True,
+        )
+        embed.add_field(name="Message Type", value=str(info["message_type"]), inline=True)
+        embed.add_field(
+            name="Channel / Guild",
+            value="<#{0}>\n`{0}` / `{1}`".format(info["channel_id"], info["guild_id"]),
+            inline=True,
+        )
+        embed.add_field(
+            name="Interaction User",
+            value=("{} (`{}`)".format(info["interaction_user"], info["interaction_user_id"])
+                   if info.get("interaction_user") else "`None`"),
+            inline=True,
+        )
+        embed.add_field(
+            name="Content",
+            value=(info["content"][:500] or "*empty*"),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Identity Match",
+            value="Carl: {} | Disboard: {}".format(
+                "✅" if info["is_carl"] else "❌",
+                "✅" if info["is_disboard"] else "❌",
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Detection Result",
+            value="Carl: {} | Disboard: {}".format(
+                "✅" if info["carl_success"] else "❌",
+                "✅" if info["disboard_success"] else "❌",
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Keywords Seen",
+            value=(
+                "Carl +: {} | Carl -: {}\nDisboard +: {} | Disboard -: {}".format(
+                    ", ".join(info["carl_success_keywords"]) or "-",
+                    ", ".join(info["carl_failure_keywords"]) or "-",
+                    ", ".join(info["disboard_success_keywords"]) or "-",
+                    ", ".join(info["disboard_failure_keywords"]) or "-",
+                )
+            ),
+            inline=False,
+        )
+
+        if info.get("embeds"):
+            for e in info["embeds"][:3]:
+                val = ""
+                if e["title"]:
+                    val += "Title: {}\n".format(e["title"][:100])
+                if e["description"]:
+                    val += "Desc: {}\n".format(e["description"][:150])
+                for f in e["fields"][:3]:
+                    val += "Field '{}': {}\n".format(f["name"][:50], f["value"][:100])
+                embed.add_field(name="Embed #{}".format(e["index"]), value=val[:1024] or "*empty*", inline=False)
+
+        if info.get("reference_message_id"):
+            embed.add_field(
+                name="Reply Reference",
+                value="Message `{}`".format(info["reference_message_id"]),
+                inline=False,
+            )
+
+        embed.set_footer(text="Success requires: bot identity + success phrase in content/embeds")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bump_test_group.command(name="detection", description="Debug bump detection for a message")
     @app_commands.describe(message_id="Message ID to analyze (optional, analyzes last bot message)")
