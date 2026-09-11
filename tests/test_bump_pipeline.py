@@ -693,6 +693,72 @@ async def test_backfill_ignores_failures():
         check("success repair lands on waitlist", len(rows) == 1 and rows[0]["user_id"] == user, str(rows))
 
 
+async def test_scan_repairs_blank_confirmation():
+    """Live-gap scenario (seen for cats.dev on 2026-09-11): the confirmation's
+    MESSAGE_CREATE arrives but under-hydrated - blank content, no embeds - so
+    detection sees no success phrase and drops it silently. The periodic scan
+    must credit it on its next pass via a fresh history fetch."""
+    print("\n[11] Periodic scan repairs blank (under-hydrated) confirmation")
+    await bump_db.init_db()
+    guild = 888888888888888888
+    user = 123456789012345678
+
+    cog = BumpCog(MagicMock())
+    cog.bot.get_user = lambda uid: SimpleNamespace(id=uid)
+
+    # What the gateway delivered: blank content, no interaction metadata.
+    blank = make_message(
+        author_id=CARL_BOT_ID,
+        content="",
+        application_id=CARL_BOT_ID,
+        guild_id=guild,
+    )
+    blank.created_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    blank.id = 888111000000000001
+
+    with patch("bot.cogs.bump.is_guild_enabled", lambda gid: asyncio.sleep(0, True)):
+        await bump_db.update_guild_settings(guild, notification_channel_id=123456789012345678)
+
+        # The live path finds nothing to do.
+        await cog.on_message(blank)
+        check("blank confirmation adds nobody live", len(await bump_db.get_guild_waitlist(guild)) == 0)
+
+        # One minute later the scan re-reads history - now fully hydrated,
+        # exactly what a fresh fetch of the same message returns.
+        hydrated = make_message(
+            author_id=CARL_BOT_ID,
+            content="You've successfully bumped this server, it is now ranked 534 out of 24274 servers!",
+            application_id=CARL_BOT_ID,
+            interaction_user_id=user,
+            guild_id=guild,
+        )
+        hydrated.created_at = blank.created_at
+        hydrated.id = blank.id
+
+        channel = MagicMock()
+        channel.id = 123456789012345678
+        async def history(limit=None):
+            yield hydrated
+        channel.history = history
+        guild_obj = MagicMock()
+        guild_obj.id = guild
+        guild_obj.get_channel = lambda cid: channel if cid == channel.id else None
+        cog.bot.guilds = [guild_obj]
+
+        await cog._scan_recent_confirmations()
+
+        rows = await bump_db.get_guild_waitlist(guild)
+        check("scan credited the blank confirmation", len(rows) == 1 and rows[0]["user_id"] == user, str(rows))
+
+        # Second pass: history replay returns the same message; the seen-set
+        # must keep it from being processed again.
+        async def history2(limit=None):
+            yield hydrated
+        channel.history = history2
+        await cog._scan_recent_confirmations()
+        check("scan pass is idempotent", len(await bump_db.get_guild_waitlist(guild)) == 1)
+
+
 def test_debug_dump():
     print("\n[5] Debug diagnostics")
     msg = make_message(
@@ -723,6 +789,7 @@ async def main():
     await test_identity_retry()
     await test_restart_bumper_repair()
     await test_backfill_ignores_failures()
+    await test_scan_repairs_blank_confirmation()
 
     print(f"\n{'=' * 50}")
     print(f"TOTAL: {PASS} passed, {FAIL} failed")

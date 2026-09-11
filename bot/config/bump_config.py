@@ -21,6 +21,10 @@ DISBOARD_COOLDOWN = timedelta(hours=2)
 BUMP_IDENTITY_RETRY_LIMIT = 7 * 24 * 60 * 60  # absolute cap: 7 days
 BUMP_IDENTITY_RETRY_DELAY = 60  # seconds between retry passes
 
+# How far back the periodic recent-confirmation scan looks each pass.
+# Comfortably covers a minute of activity in a busy bump channel.
+BUMP_RECENT_SCAN_LIMIT = 30
+
 # Detection keywords
 CARL_SUCCESS_KEYWORDS: List[str] = [
     "bump successful",

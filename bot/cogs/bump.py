@@ -14,6 +14,7 @@ from discord.ext import commands
 from bot.config.bump_config import (
     BUMP_IDENTITY_RETRY_DELAY,
     BUMP_IDENTITY_RETRY_LIMIT,
+    BUMP_RECENT_SCAN_LIMIT,
     CARL_BOT_ID,
     CARL_COOLDOWN,
     DISBOARD_BOT_ID,
@@ -75,6 +76,10 @@ class BumpCog(commands.Cog):
         self.scheduler: Optional[BumpScheduler] = None
         self._backfill_task: Optional[asyncio.Task] = None
         self._identity_retry_task: Optional[asyncio.Task] = None
+        # Per-guild ids of bump-bot messages the periodic scan has already
+        # looked at; primed by the startup backfill so only genuinely new
+        # confirmations get processed.
+        self._seen_confirmation_ids: dict = {}
 
     async def cog_load(self) -> None:
         """Initialize database and start scheduler when cog loads."""
@@ -377,12 +382,20 @@ class BumpCog(commands.Cog):
         message reliably carries it - the diagnostic command proves this
         regularly. Queued messages are re-fetched every pass until the
         identity resolves or the retry window expires.
+
+        Each pass also re-scans the newest channel messages: a bump
+        confirmation can reach us under-hydrated (blank content/embeds, so
+        detection finds nothing) or not reach us at all (gateway hiccup
+        without a disconnect). Fresh history fetches always carry the full
+        text and interaction metadata, so the scan closes both gaps within
+        one retry interval.
         """
         try:
             await self.bot.wait_until_ready()
             while True:
                 try:
                     await self._repair_pending_bumpers()
+                    await self._scan_recent_confirmations()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -390,6 +403,46 @@ class BumpCog(commands.Cog):
                 await asyncio.sleep(BUMP_IDENTITY_RETRY_DELAY)
         except asyncio.CancelledError:
             pass
+
+    async def _scan_recent_confirmations(self) -> None:
+        """Repair newly-arrived confirmations that the live path missed.
+
+        Runs every retry pass over the newest few channel messages. Anything
+        already seen (live, startup backfill, or a previous pass) is skipped,
+        so the cost is one small history fetch per guild per pass and each
+        message is processed exactly once.
+        """
+        for guild in list(self.bot.guilds):
+            try:
+                if not await is_guild_enabled(guild.id):
+                    continue
+                settings = await get_guild_settings(guild.id)
+                channel_id = settings.get("notification_channel_id")
+                channel = guild.get_channel(channel_id) if channel_id else None
+                if channel is None or not hasattr(channel, "history"):
+                    continue
+
+                seen = self._seen_confirmation_ids.setdefault(guild.id, set())
+                repaired = 0
+                async for msg in channel.history(limit=BUMP_RECENT_SCAN_LIMIT):
+                    if msg.author.id not in (CARL_BOT_ID, DISBOARD_BOT_ID) and msg.application_id not in (
+                        CARL_BOT_ID,
+                        DISBOARD_BOT_ID,
+                    ):
+                        continue
+                    if msg.id in seen:
+                        continue
+                    seen.add(msg.id)
+                    if await self._repair_backfill_message(msg):
+                        repaired += 1
+                if repaired:
+                    logger.info(
+                        "Bump scan: repaired %d missed confirmation(s) in guild %d",
+                        repaired,
+                        guild.id,
+                    )
+            except Exception:
+                logger.exception("Bump recent-confirmation scan failed for guild %s", guild.id)
 
     async def _repair_pending_bumpers(self) -> None:
         """Resolve queued confirmations and move them onto the waitlist."""
@@ -575,11 +628,13 @@ class BumpCog(commands.Cog):
 
                     processed = 0
                     repaired = 0
+                    seen = self._seen_confirmation_ids.setdefault(guild.id, set())
                     async for msg in channel.history(limit=100):
                         if msg.author.id in (CARL_BOT_ID, DISBOARD_BOT_ID) or msg.application_id in (
                             CARL_BOT_ID,
                             DISBOARD_BOT_ID,
                         ):
+                            seen.add(msg.id)  # the periodic scan skips these
                             if await self._repair_backfill_message(msg):
                                 repaired += 1
                             processed += 1
