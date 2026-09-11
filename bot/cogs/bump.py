@@ -505,7 +505,15 @@ class BumpCog(commands.Cog):
         if not msg.guild:
             return False
 
-        service = "carl" if CARL_BOT_ID in (msg.author.id, msg.application_id) else "disboard"
+        # Only successful bumps may be repaired. Cooldown/failure notices are
+        # bump-bot messages too, and crediting them would put people on the
+        # waitlist for bumps that never happened (seen live: an "You're on
+        # cooldown" notice added a phantom entry after a restart).
+        service = await detect_bump(msg)
+        if service is None:
+            await self.on_message(msg)  # keep logging/state handling consistent
+            return False
+
         cooldown = CARL_COOLDOWN if service == "carl" else DISBOARD_COOLDOWN
         ping_at = int((msg.created_at + cooldown).timestamp())
         now = int(datetime.now(timezone.utc).timestamp())

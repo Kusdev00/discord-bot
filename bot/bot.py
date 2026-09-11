@@ -2,6 +2,7 @@
 Core bot class with setup, event handling, and cog management.
 """
 
+import asyncio
 import discord
 import os
 import time
@@ -11,6 +12,14 @@ from bot.config import Config
 from bot.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+# Zombie-connection watchdog tuning. A healthy gateway connection receives
+# frames constantly (heartbeats alone arrive every ~40s); if NOTHING arrives
+# for this long, events are not being delivered and only a process restart
+# recovers - systemd restarts us automatically when we exit.
+ZOMBIE_TRAFFIC_TIMEOUT = 300  # seconds without gateway frames = dead
+ZOMBIE_WATCH_INTERVAL = 60  # seconds between liveness checks
 
 
 class DiscordBot(commands.Bot):
@@ -29,7 +38,11 @@ class DiscordBot(commands.Bot):
             help_command=None,  # We'll implement custom help
             activity=self._get_activity(),
             status=discord.Status.online,
-            heartbeat_timeout=60.0,  # Reconnect if the gateway goes quiet (zombie-connection guard)
+            heartbeat_timeout=60.0,  # Reconnect if the socket stops acking heartbeats
+            # Required for on_socket_raw_receive below: discord.py only wires
+            # that event up when debug events are enabled, and without it the
+            # liveness timestamp never updates (silently broke the watchdog).
+            enable_debug_events=True,
         )
 
         # Watchdog: last time we received ANY traffic from the Discord gateway.
@@ -37,6 +50,7 @@ class DiscordBot(commands.Bot):
         # keeps the process alive but stops delivering events (messages, commands),
         # which silently breaks bump detection. Exited so systemd restarts us.
         self._last_gateway_rx = time.monotonic()
+        self._watchdog_task: asyncio.Task = None
 
     def _get_activity(self) -> discord.Activity:
         """Create activity from config."""
@@ -51,6 +65,13 @@ class DiscordBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Called when the bot is starting up. Load cogs and sync commands."""
+        logger.info("Starting bot setup...")
+
+        # Zombie-connection watchdog: continuously verify the gateway is
+        # actually delivering frames. (Must not run from on_ready - that only
+        # fires on (re)connect, so it killed freshly-reconnected processes
+        # based on a stale timestamp while a real zombie was never caught.)
+        self._watchdog_task = asyncio.create_task(self._gateway_watchdog())
         logger.info("Starting bot setup...")
 
         # Load cogs
@@ -89,6 +110,28 @@ class DiscordBot(commands.Bot):
         """Track liveness: any gateway traffic means the connection is real."""
         self._last_gateway_rx = time.monotonic()
 
+    async def _gateway_watchdog(self) -> None:
+        """Continuously check that gateway frames are still arriving.
+
+        Runs every ZOMBIE_WATCH_INTERVAL and exits the process when no frame
+        (heartbeat ack, dispatch, anything) has arrived for
+        ZOMBIE_TRAFFIC_TIMEOUT. The initial _last_gateway_rx set in __init__
+        doubles as the startup grace period.
+        """
+        try:
+            while not self.is_closed():
+                await asyncio.sleep(ZOMBIE_WATCH_INTERVAL)
+                idle = time.monotonic() - self._last_gateway_rx
+                if idle > ZOMBIE_TRAFFIC_TIMEOUT:
+                    logger.error(
+                        "No gateway traffic for %.0f minutes - zombie connection detected; "
+                        "exiting so systemd restarts the bot with a fresh session",
+                        idle / 60,
+                    )
+                    os._exit(1)
+        except asyncio.CancelledError:
+            pass
+
     async def on_ready(self) -> None:
         """Called when the bot is ready and connected."""
         logger.info(
@@ -97,17 +140,6 @@ class DiscordBot(commands.Bot):
             self.user.id if self.user else 0,
             len(self.guilds),
         )
-
-        # Zombie connection guard: if ready fired but we have not received a
-        # single gateway frame in over an hour, events are not being delivered.
-        idle = time.monotonic() - self._last_gateway_rx
-        if idle > 3600:
-            logger.error(
-                "No gateway traffic for %.0f minutes - zombie connection detected; "
-                "exiting so systemd restarts the bot with a fresh session",
-                idle / 60,
-            )
-            os._exit(1)
 
         # Log guild info in debug mode
         if Config.DEBUG:

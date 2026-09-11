@@ -646,6 +646,53 @@ async def test_restart_bumper_repair():
         check("waitlist unchanged by stale confirmation", len(await bump_db.get_guild_waitlist(guild)) == 1)
 
 
+async def test_backfill_ignores_failures():
+    """Backfill repair must only credit successful bumps. Seen live on the
+    Oracle server: a restart backfill added a phantom waitlist entry from a
+    Carl-bot "You're on cooldown" FAILURE notice, because the repair path
+    never checked the detection result."""
+    print("\n[10] Backfill repair ignores cooldown/failure notices")
+    await bump_db.init_db()
+    guild = 777777777777777777
+    user = 123456789012345678
+    now = datetime.now(timezone.utc)
+
+    cog = BumpCog(MagicMock())
+    cog.bot.get_user = lambda uid: SimpleNamespace(id=uid)
+
+    # Real-looking cooldown failure: bot identity + invoking user, no success
+    # phrase - exactly what Carl-bot posts to a second bumper.
+    failure = make_message(
+        author_id=CARL_BOT_ID,
+        content="You're on cooldown, you can bump this server again <t:1789125653:R>",
+        application_id=CARL_BOT_ID,
+        interaction_user_id=user,
+        guild_id=guild,
+    )
+    failure.created_at = now - timedelta(minutes=5)
+    failure.id = 777000000000000001
+
+    with patch("bot.cogs.bump.is_guild_enabled", lambda gid: asyncio.sleep(0, True)):
+        repaired = await cog._repair_backfill_message(failure)
+        check("failure notice repairs nobody", repaired is False)
+        check("failure notice adds no waitlist row", len(await bump_db.get_guild_waitlist(guild)) == 0)
+
+        # Sanity: a genuine success from the same user still repairs fine.
+        success = make_message(
+            author_id=CARL_BOT_ID,
+            content="You've successfully bumped this server, it is now ranked 533 out of 24120 servers!",
+            application_id=CARL_BOT_ID,
+            interaction_user_id=user,
+            guild_id=guild,
+        )
+        success.created_at = now - timedelta(minutes=5)
+        success.id = 777000000000000002
+        repaired = await cog._repair_backfill_message(success)
+        check("genuine success still repairs", repaired is True)
+        rows = await bump_db.get_guild_waitlist(guild)
+        check("success repair lands on waitlist", len(rows) == 1 and rows[0]["user_id"] == user, str(rows))
+
+
 def test_debug_dump():
     print("\n[5] Debug diagnostics")
     msg = make_message(
@@ -675,6 +722,7 @@ async def main():
     await test_restart_persistence()
     await test_identity_retry()
     await test_restart_bumper_repair()
+    await test_backfill_ignores_failures()
 
     print(f"\n{'=' * 50}")
     print(f"TOTAL: {PASS} passed, {FAIL} failed")
